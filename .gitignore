@@ -34,3 +34,5 @@ server-classes/
 .idea/
 *.iml
 
+### Assistants ###
+CLAUDE.md
