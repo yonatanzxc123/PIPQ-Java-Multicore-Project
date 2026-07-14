@@ -1,4 +1,5 @@
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicStampedReference;
 
 /**
  * Element stored by both PIPQ levels.
@@ -14,7 +15,7 @@ public final class Node<V> implements Comparable<Node<V>> {
     private final int tid;
     private final long sequence;
 
-    Node<V> next;
+    public AtomicStampedReference<Node<V>> next;
 
     public Node(long key, V value, int tid, long sequence) {
         this(key, value, tid, sequence, false);
@@ -48,6 +49,22 @@ public final class Node<V> implements Comparable<Node<V>> {
 
     public long sequence() {
         return sequence;
+    }
+
+    // whether THIS node is moved
+    public boolean movedBit()
+    {
+        int[] stampHolder = new int[1];
+        Node<V> n = next.get(stampHolder);
+        return (stampHolder[0] & 2) != 0;
+    }
+
+    // whether NEXT node is logically deleted
+    public boolean delBit()
+    {
+        int[] stampHolder = new int[1];
+        Node<V> n = next.get(stampHolder);
+        return (stampHolder[0] & 1) != 0;
     }
 
     @Override

@@ -9,8 +9,6 @@ public interface LeaderLayer<V> {
 
     Node<V> maxByThread(int tid);
 
-    int sizeByThread(int tid);
-
     int size();
 
     List<Node<V>> snapshot();

@@ -21,7 +21,7 @@ public final class Pipq<V> {
     private static final int REQUIRED_LEADER_MINIMUM = 2;
 
     private final WorkerHeap<V>[] workerHeaps;
-    private final SortedLinkedListLeader<V> leader;
+    private final LeaderLinkedList<V> leader;
     private final int[] leaderCounters;
     private final int cntrMin;
     private final int cntrMax;
@@ -52,7 +52,7 @@ public final class Pipq<V> {
         for (int i = 0; i < numberOfThreads; i++) {
             workerHeaps[i] = new WorkerHeap<>(initialWorkerHeapCapacity);
         }
-        this.leader = new SortedLinkedListLeader<>();
+        this.leader = new LeaderLinkedList<>(numberOfThreads);
         this.leaderCounters = new int[numberOfThreads];
         this.cntrMin = cntrMin;
         this.cntrMax = cntrMax;
@@ -74,34 +74,29 @@ public final class Pipq<V> {
                 return;
             }
 
-            leader.lock();
-            try {
-                if (leaderCounters[tid] < cntrMax) {
-                    insertIntoLeader(node);
-                    leaderCounters[tid]++;
-                    stats.recordSlowerPathInsert();
-                    return;
-                }
-
-                Node<V> worstLeaderForTid = leader.maxByThreadUnlocked(tid);
-                if (worstLeaderForTid != null && key >= worstLeaderForTid.key()) {
-                    insertIntoWorker(heap, node);
-                    stats.recordFastPathInsert();
-                    return;
-                }
-
+            if (leaderCounters[tid] < cntrMax) {
                 insertIntoLeader(node);
-                Node<V> movedDown = leader.deleteMaxByThreadUnlocked(tid);
-                if (movedDown == null) {
-                    throw new IllegalStateException("leader counter indicated a node for tid " + tid
-                            + " but deleteMaxByThread found none");
-                }
-                stats.recordLeaderDeleteMaxByThread();
-                insertIntoWorker(heap, movedDown);
-                stats.recordSlowestPathInsert();
-            } finally {
-                leader.unlock();
+                leaderCounters[tid]++;
+                stats.recordSlowerPathInsert();
+                return;
             }
+
+            Node<V> worstLeaderForTid = leader.maxByThread(tid);
+            if (worstLeaderForTid != null && key >= worstLeaderForTid.key()) {
+                insertIntoWorker(heap, node);
+                stats.recordFastPathInsert();
+                return;
+            }
+
+            insertIntoLeader(node);
+            Node<V> movedDown = leader.deleteMaxByThread(tid);
+            if (movedDown == null) {
+                throw new IllegalStateException("leader counter indicated a node for tid " + tid
+                        + " but deleteMaxByThread found none");
+            }
+            stats.recordLeaderDeleteMaxByThread();
+            insertIntoWorker(heap, movedDown);
+            stats.recordSlowestPathInsert();
         } finally {
             heap.unlock();
         }
@@ -120,22 +115,17 @@ public final class Pipq<V> {
             Node<V> removed;
             int ownerTid;
 
-            leader.lock();
-            try {
-                stats.recordLeaderDeleteMin();
-                removed = leader.deleteMinUnlocked();
-                if (removed == null) {
-                    return Optional.empty();
-                }
-
-                ownerTid = removed.tid();
-                if (leaderCounters[ownerTid] <= 0) {
-                    throw new IllegalStateException("leader counter for tid " + ownerTid + " is already zero");
-                }
-                leaderCounters[ownerTid]--;
-            } finally {
-                leader.unlock();
+            stats.recordLeaderDeleteMin();
+            removed = leader.deleteMin();
+            if (removed == null) {
+                return Optional.empty();
             }
+
+            ownerTid = removed.tid();
+            if (leaderCounters[ownerTid] <= 0) {
+                throw new IllegalStateException("leader counter for tid " + ownerTid + " is already zero");
+            }
+            leaderCounters[ownerTid]--;
 
             promoteFromWorkerIfCounterBelow(ownerTid, REQUIRED_LEADER_MINIMUM);
             return Optional.of(removed);
@@ -163,12 +153,7 @@ public final class Pipq<V> {
     public boolean validateLeaderCounters() {
         lockAllWorkers();
         try {
-            leader.lock();
-            try {
-                return Arrays.equals(leaderCounters, leader.countsByThreadUnlocked(workerHeaps.length));
-            } finally {
-                leader.unlock();
-            }
+            return Arrays.equals(leaderCounters, leader.countsByThread(workerHeaps.length));
         } finally {
             unlockAllWorkersReverse();
         }
@@ -177,27 +162,22 @@ public final class Pipq<V> {
     public boolean validateInvariant() {
         lockAllWorkers();
         try {
-            leader.lock();
-            try {
-                if (!leader.validateSortedUnlocked()) {
-                    return false;
-                }
-                if (!Arrays.equals(leaderCounters, leader.countsByThreadUnlocked(workerHeaps.length))) {
-                    return false;
-                }
-
-                List<Node<V>> nodes = leader.snapshotUnlocked();
-                for (Node<V> leaderNode : nodes) {
-                    Node<V> workerMin = workerHeaps[leaderNode.tid()].peekMinUnlocked();
-                    if (workerMin != null && leaderNode.key() > workerMin.key()) {
-                        return false;
-                    }
-                }
-
-                return true;
-            } finally {
-                leader.unlock();
+            if (!leader.validateSorted()) {
+                return false;
             }
+            if (!Arrays.equals(leaderCounters, leader.countsByThread(workerHeaps.length))) {
+                return false;
+            }
+
+            List<Node<V>> nodes = leader.snapshot();
+            for (Node<V> leaderNode : nodes) {
+                Node<V> workerMin = workerHeaps[leaderNode.tid()].peekMinUnlocked();
+                if (workerMin != null && leaderNode.key() > workerMin.key()) {
+                    return false;
+                }
+            }
+
+            return true;
         } finally {
             unlockAllWorkersReverse();
         }
@@ -221,12 +201,7 @@ public final class Pipq<V> {
 
     public int leaderCounter(int tid) {
         validateTid(tid);
-        leader.lock();
-        try {
-            return leaderCounters[tid];
-        } finally {
-            leader.unlock();
-        }
+        return leaderCounters[tid];
     }
 
     public int leaderSize() {
@@ -251,31 +226,26 @@ public final class Pipq<V> {
         WorkerHeap<V> heap = workerHeaps[tid];
         heap.lock();
         try {
-            leader.lock();
-            try {
-                if (leaderCounters[tid] >= threshold) {
-                    return false;
-                }
-
-                Node<V> promoted = heap.deleteMinUnlocked();
-                if (promoted == null) {
-                    return false;
-                }
-
-                insertIntoLeader(promoted);
-                leaderCounters[tid]++;
-                stats.recordWorkerHeapDeleteMinPromotion();
-                return true;
-            } finally {
-                leader.unlock();
+            if (leaderCounters[tid] >= threshold) {
+                return false;
             }
+
+            Node<V> promoted = heap.deleteMinUnlocked();
+            if (promoted == null) {
+                return false;
+            }
+
+            insertIntoLeader(promoted);
+            leaderCounters[tid]++;
+            stats.recordWorkerHeapDeleteMinPromotion();
+            return true;
         } finally {
             heap.unlock();
         }
     }
 
     private void insertIntoLeader(Node<V> node) {
-        leader.insertUnlocked(node);
+        leader.insert(node);
         stats.recordLeaderInsert();
     }
 
