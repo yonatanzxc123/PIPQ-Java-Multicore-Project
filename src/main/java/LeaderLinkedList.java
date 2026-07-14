@@ -29,8 +29,8 @@ public class LeaderLinkedList<V> implements LeaderLayer<V> {
      */
     private static final int MAX_OFFSET = 32;
 
-    private final Node<V> head = Node.sentinel(Long.MIN_VALUE, Long.MIN_VALUE);
-    private final Node<V> tail = Node.sentinel(Long.MAX_VALUE, Long.MAX_VALUE);
+    private final Node<V> head = Node.sentinel(Long.MIN_VALUE);
+    private final Node<V> tail = Node.sentinel(Long.MAX_VALUE);
     private final Node<V>[] maxPerTid;
     private final AtomicInteger size = new AtomicInteger(0);
 
@@ -76,6 +76,7 @@ public class LeaderLinkedList<V> implements LeaderLayer<V> {
         }
     }
 
+    // Plain array write, safe per LeaderLayer's documented per-tid mutual-exclusion contract.
     private void updateLargestByThread(Node<V> node) {
         Node<V> currentLargest = maxPerTid[node.tid()];
         if (currentLargest == null || node.key() > currentLargest.key()) {
@@ -171,9 +172,11 @@ public class LeaderLinkedList<V> implements LeaderLayer<V> {
      * by the slowest insert path to make room for a new node before pushing it into the list.
      * Returns {@code null} if {@code tid} currently has no node in the list.
      *
-     * <p>Correctness relies on {@code maxPerTid[tid]} being single-writer (only thread
-     * {@code tid} ever inserts/removes its own tid-tagged nodes) — see class javadoc and
-     * {@link #updateLargestByThread}. {@code startLeadLargest} is captured once, up front,
+     * <p>Correctness relies on the caller-enforced per-tid mutual exclusion documented on
+     * {@link LeaderLayer} — not on any one Java thread owning {@code tid} forever, since
+     * {@code Pipq}'s coordinator/promotion path can write {@code maxPerTid[tid]} on {@code
+     * tid}'s behalf too (see {@link #updateLargestByThread}). {@code startLeadLargest} is
+     * captured once, up front,
      * and reused across every {@code searchDelete} retry (mirrors the paper's fixed
      * {@code start_lead_largest} local, reused across the {@code repeat} at line 3).</p>
      */
@@ -302,9 +305,10 @@ public class LeaderLinkedList<V> implements LeaderLayer<V> {
      * is written into {@code maxPerTid[tid]} before returning, mirroring the paper's
      * {@code lead_largest ← new_lead_largest} (line 35).
      *
-     * <p>{@code maxPerTid[tid]} is only ever written by thread {@code tid} itself (here, and
-     * in {@link #updateLargestByThread} on insert), so the plain array write is safe — same
-     * single-writer assumption as elsewhere in this class.</p>
+     * <p>{@code maxPerTid[tid]} write here relies on the same {@link LeaderLayer}-documented
+     * per-tid mutual exclusion as {@link #updateLargestByThread} — safe because the caller
+     * (always {@code Pipq}, holding {@code workerHeaps[tid]}'s lock) serializes all access to
+     * this slot, not because a single Java thread owns {@code tid}.</p>
      */
     Window<V> searchDelete(int tid, Node<V> startLeadLargest) {
         while (true) {

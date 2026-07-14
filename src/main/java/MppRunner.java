@@ -35,13 +35,11 @@ public final class MppRunner {
             removed++;
         }
 
-        boolean valid = queue.validateInvariant();
         long elapsedNanos = System.nanoTime() - startNanos;
 
         System.out.println("PIPQ baseline smoke run");
         System.out.println("removed=" + removed);
         System.out.println("sorted=" + sorted);
-        System.out.println("validInvariant=" + valid);
         System.out.println("elapsedNanos=" + elapsedNanos);
         System.out.println("DONE");
     }

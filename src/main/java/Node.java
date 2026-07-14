@@ -5,34 +5,32 @@ import java.util.concurrent.atomic.AtomicStampedReference;
  * Element stored by both PIPQ levels.
  *
  * <p>The paper stores key/value pairs in worker heaps and key/value/tid tuples in
- * the leader list. The Java baseline keeps the original inserting thread id and
- * a unique sequence number on every node so elements can move between levels
- * without losing ownership or deterministic tie-breaking.</p>
+ * the leader list. The Java baseline keeps the original inserting thread id on
+ * every node so elements can move between levels without losing ownership.
+ * Equal-key nodes compare equal (paper: duplicates in undefined order).</p>
  */
 public final class Node<V> implements Comparable<Node<V>> {
     private final long key;
     private final V value;
     private final int tid;
-    private final long sequence;
 
     public AtomicStampedReference<Node<V>> next;
 
-    public Node(long key, V value, int tid, long sequence) {
-        this(key, value, tid, sequence, false);
+    public Node(long key, V value, int tid) {
+        this(key, value, tid, false);
     }
 
-    private Node(long key, V value, int tid, long sequence, boolean sentinel) {
+    private Node(long key, V value, int tid, boolean sentinel) {
         if (!sentinel && tid < 0) {
             throw new IllegalArgumentException("tid must be non-negative");
         }
         this.key = key;
         this.value = value;
         this.tid = tid;
-        this.sequence = sequence;
     }
 
-    static <V> Node<V> sentinel(long key, long sequence) {
-        return new Node<>(key, null, -1, sequence, true);
+    static <V> Node<V> sentinel(long key) {
+        return new Node<>(key, null, -1, true);
     }
 
     public long key() {
@@ -45,10 +43,6 @@ public final class Node<V> implements Comparable<Node<V>> {
 
     public int tid() {
         return tid;
-    }
-
-    public long sequence() {
-        return sequence;
     }
 
     // whether THIS node is moved
@@ -73,11 +67,7 @@ public final class Node<V> implements Comparable<Node<V>> {
     }
 
     static int compare(Node<?> left, Node<?> right) {
-        int byKey = Long.compare(left.key, right.key);
-        if (byKey != 0) {
-            return byKey;
-        }
-        return Long.compare(left.sequence, right.sequence);
+        return Long.compare(left.key, right.key);
     }
 
     @Override
@@ -86,7 +76,6 @@ public final class Node<V> implements Comparable<Node<V>> {
                 + "key=" + key
                 + ", value=" + value
                 + ", tid=" + tid
-                + ", sequence=" + sequence
                 + '}';
     }
 
@@ -101,12 +90,11 @@ public final class Node<V> implements Comparable<Node<V>> {
         Node<?> other = (Node<?>) obj;
         return key == other.key
                 && tid == other.tid
-                && sequence == other.sequence
                 && Objects.equals(value, other.value);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(key, value, tid, sequence);
+        return Objects.hash(key, value, tid);
     }
 }

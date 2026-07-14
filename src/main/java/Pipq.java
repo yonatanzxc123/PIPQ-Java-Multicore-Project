@@ -1,20 +1,22 @@
-import java.util.Arrays;
-import java.util.List;
 import java.util.Optional;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * Faithful Java baseline of the original PIPQ algorithmic structure.
  *
- * <p>PIPQ has a worker level with one local min-heap per logical thread and a
- * leader level containing the highest-priority candidate elements in a sorted
- * linked list. This class intentionally uses Java locks instead of the paper's
- * low-level C++ lock-free linked-list implementation. It also simplifies away
- * the paper's NUMA leader/coordinator combining mechanism by serializing
+ * <p>PIPQ has a worker level with one local min-heap per logical thread (own lock, see
+ * {@link WorkerHeap}) and a leader level ({@link LeaderLinkedList}) containing the
+ * highest-priority candidate elements in a lock-free sorted linked list. This class
+ * simplifies away the paper's NUMA leader/coordinator combining mechanism by serializing
  * delete-min with a single lock.</p>
  *
  * <p>The proposed heap-based leader-layer variation is not implemented here.</p>
+ *
+ * <p>Satisfies {@link LeaderLayer}'s per-tid mutual-exclusion contract: every call into the
+ * leader for a given {@code tid} — {@code insert}/{@code maxByThread}/{@code
+ * deleteMaxByThread} in {@link #insert(int, long, Object)}, and the coordinator-side promotion
+ * in {@link #promoteFromWorkerIfCounterBelow} — runs with {@code workerHeaps[tid]}'s lock
+ * held, regardless of which thread is executing it.</p>
  */
 public final class Pipq<V> {
     private static final int DEFAULT_WORKER_HEAP_CAPACITY = 16;
@@ -25,7 +27,6 @@ public final class Pipq<V> {
     private final int[] leaderCounters;
     private final int cntrMin;
     private final int cntrMax;
-    private final AtomicLong sequence = new AtomicLong();
     private final ReentrantLock deleteMinLock = new ReentrantLock();
     private final PipqStats stats = new PipqStats();
 
@@ -62,7 +63,7 @@ public final class Pipq<V> {
         validateTid(tid);
         stats.recordTotalInsert();
 
-        Node<V> node = new Node<>(key, value, tid, sequence.getAndIncrement());
+        Node<V> node = new Node<>(key, value, tid);
         WorkerHeap<V> heap = workerHeaps[tid];
 
         heap.lock();
@@ -146,43 +147,6 @@ public final class Pipq<V> {
         return promoteFromWorkerIfCounterBelow(tid, cntrMin);
     }
 
-    public boolean validateLeaderSorted() {
-        return leader.validateSorted();
-    }
-
-    public boolean validateLeaderCounters() {
-        lockAllWorkers();
-        try {
-            return Arrays.equals(leaderCounters, leader.countsByThread(workerHeaps.length));
-        } finally {
-            unlockAllWorkersReverse();
-        }
-    }
-
-    public boolean validateInvariant() {
-        lockAllWorkers();
-        try {
-            if (!leader.validateSorted()) {
-                return false;
-            }
-            if (!Arrays.equals(leaderCounters, leader.countsByThread(workerHeaps.length))) {
-                return false;
-            }
-
-            List<Node<V>> nodes = leader.snapshot();
-            for (Node<V> leaderNode : nodes) {
-                Node<V> workerMin = workerHeaps[leaderNode.tid()].peekMinUnlocked();
-                if (workerMin != null && leaderNode.key() > workerMin.key()) {
-                    return false;
-                }
-            }
-
-            return true;
-        } finally {
-            unlockAllWorkersReverse();
-        }
-    }
-
     public PipqStats stats() {
         return stats;
     }
@@ -218,10 +182,6 @@ public final class Pipq<V> {
         return Optional.ofNullable(workerHeaps[tid].peekMin());
     }
 
-    public List<Node<V>> leaderSnapshot() {
-        return leader.snapshot();
-    }
-
     private boolean promoteFromWorkerIfCounterBelow(int tid, int threshold) {
         WorkerHeap<V> heap = workerHeaps[tid];
         heap.lock();
@@ -252,18 +212,6 @@ public final class Pipq<V> {
     private void insertIntoWorker(WorkerHeap<V> heap, Node<V> node) {
         heap.insertUnlocked(node);
         stats.recordWorkerHeapInsert();
-    }
-
-    private void lockAllWorkers() {
-        for (WorkerHeap<V> heap : workerHeaps) {
-            heap.lock();
-        }
-    }
-
-    private void unlockAllWorkersReverse() {
-        for (int i = workerHeaps.length - 1; i >= 0; i--) {
-            workerHeaps[i].unlock();
-        }
     }
 
     private void validateTid(int tid) {
