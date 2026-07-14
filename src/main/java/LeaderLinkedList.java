@@ -223,45 +223,6 @@ public class LeaderLinkedList<V> implements LeaderLayer<V> {
         return size.get();
     }
 
-    @Override
-    public List<Node<V>> snapshot() {
-        List<Node<V>> nodes = new ArrayList<>();
-        Node<V> cur = head.next.getReference();
-        while (cur != tail) {
-            nodes.add(cur);
-            cur = cur.next.getReference();
-        }
-        return nodes;
-    }
-
-    /**
-     * Validation-only helper (not part of {@link LeaderLayer}): scans the list to count
-     * live nodes per thread. Mirrors the old {@code SortedLinkedListLeader}'s counting
-     * used by {@code Pipq.validateLeaderCounters}/{@code validateInvariant} — the real
-     * per-thread counters are tracked O(1) in {@code Pipq.leaderCounters}, this is only
-     * for cross-checking that count in tests.
-     */
-    int[] countsByThread(int threadCount) {
-        int[] counts = new int[threadCount];
-        for (Node<V> node : snapshot()) {
-            if (node.tid() >= 0 && node.tid() < threadCount) {
-                counts[node.tid()]++;
-            }
-        }
-        return counts;
-    }
-
-    @Override
-    public boolean validateSorted() {
-        List<Node<V>> nodes = snapshot();
-        for (int i = 1; i < nodes.size(); i++) {
-            if (Node.compare(nodes.get(i - 1), nodes.get(i)) > 0) {
-                return false;
-            }
-        }
-        return true;
-    }
-
     // ============== Utility ==============
 
     /**

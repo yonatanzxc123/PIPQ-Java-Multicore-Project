@@ -10,8 +10,4 @@ public interface LeaderLayer<V> {
     Node<V> maxByThread(int tid);
 
     int size();
-
-    List<Node<V>> snapshot();
-
-    boolean validateSorted();
 }
