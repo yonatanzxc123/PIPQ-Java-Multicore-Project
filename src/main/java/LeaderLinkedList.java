@@ -12,13 +12,22 @@ import java.util.concurrent.atomic.AtomicStampedReference;
  * successor of this node is logically deleted (set on the predecessor, Linden-style);
  * bit 1 ({@code moving}) means this node itself is being moved by a concurrent
  * by-thread delete (set on the node itself, Harris-style). {@code search}, {@code insert}
- * (with {@code lead_largest} tracking), {@code maxByThread}, and {@code deleteMaxByThread}
- * (with its {@code searchDelete}/{@code searchPhysDel} helpers) are implemented here;
- * {@code deleteMin} is ported in a later pass.</p>
+ * (with {@code lead_largest} tracking), {@code maxByThread}, {@code deleteMaxByThread}
+ * (with its {@code searchDelete}/{@code searchPhysDel} helpers), and {@code deleteMin} are all
+ * implemented here.</p>
  */
 public class LeaderLinkedList<V> implements LeaderLayer<V> {
     private static final int LOGDEL_BIT = 1;
     private static final int MOVING_BIT = 2;
+
+    /**
+     * Batched-physical-deletion threshold for {@link #deleteMin}, ported from the paper's
+     * Lindén-Jonsson-style {@code MAX_OFFSET} (Algorithm 5 line 14). Once more than this many
+     * logically-deleted nodes have accumulated at the front of the list, {@code deleteMin}
+     * snips the whole prefix in one {@code head.next} store instead of leaving them for the
+     * next traversal to skip one-by-one.
+     */
+    private static final int MAX_OFFSET = 32;
 
     private final Node<V> head = Node.sentinel(Long.MIN_VALUE, Long.MIN_VALUE);
     private final Node<V> tail = Node.sentinel(Long.MAX_VALUE, Long.MAX_VALUE);
@@ -74,9 +83,86 @@ public class LeaderLinkedList<V> implements LeaderLayer<V> {
         }
     }
 
+    /**
+     * Ported from {@code L-DeleteMin} (Algorithm 5, paper p.13). Removes and returns the
+     * global minimum — {@code head}'s first live successor. Returns {@code null} if the list
+     * is empty ({@code EMPTY} in the paper).
+     *
+     * <p>Relies on delete-min being globally serialized by the caller (paper: "only one thread
+     * is ever performing a delete-min operation at the time"; our baseline enforces this via
+     * {@code Pipq.deleteMinLock}). Only {@code LOGDEL} is ever checked/set here — never
+     * {@code MOVING} — because the ≥2-elements-per-thread invariant (Lemma 2/4) guarantees the
+     * global min can never simultaneously be some thread's {@code deleteMaxByThread} target,
+     * matching the paper's own omission of moving-bit checks in this algorithm.</p>
+     *
+     * <p>{@code maxPerTid} is deliberately left untouched, exactly as in the paper: if the
+     * removed node happened to be some tid's {@code maxPerTid[tid]}, that pointer only goes
+     * stale in the narrow window before it self-heals via that tid's next {@code insert}
+     * ({@link #updateLargestByThread}) or next {@code deleteMaxByThread} call (which
+     * re-derives it in {@link #searchDelete}).</p>
+     */
     @Override
     public Node<V> deleteMin() {
-        throw new UnsupportedOperationException("not yet implemented");
+        Node<V> x = head;
+        int offset = 0;
+
+        while (true) {
+            int[] xNextStamp = new int[1];
+            Node<V> xNextRef = x.next.get(xNextStamp);
+
+            // Paper line 7: get_notlogdel_ref(x_next) == list.tail -> list is empty. The
+            // MOVING bit never applies to tail (it's a sentinel, never anyone's move target),
+            // so a plain reference check already matches "notlogdel_ref".
+            if (xNextRef == tail) {
+                return null;
+            }
+
+            if ((xNextStamp[0] & LOGDEL_BIT) != 0) {
+                // Paper lines 9-10: x's successor was already logically deleted by an
+                // earlier delete-min call and not yet physically unlinked -> skip past it
+                // and keep looking for the true (live) min.
+                offset++;
+                x = xNextRef;
+                continue;
+            }
+
+            // Paper line 11: x_next <- fetch_and_or(&x.next, LOGDEL_BIT). Real hardware
+            // fetch-and-or always succeeds unconditionally in one step; Java's
+            // AtomicStampedReference has no atomic bitwise-or, so this is emulated with a
+            // CAS that only ever changes the stamp (reference held fixed at xNextRef).
+            // Unlike real fetch_and_or this CAS *can* fail -- e.g. a concurrent insert()
+            // splicing a new, smaller-key node in ahead of xNextRef -- so on failure just
+            // retry with a fresh read of x.next (x itself doesn't move). This is a
+            // Java-translation detail with no counterpart in the paper, so it does not
+            // advance offset.
+            if (!x.next.compareAndSet(xNextRef, xNextRef, xNextStamp[0], xNextStamp[0] | LOGDEL_BIT)) {
+                continue;
+            }
+
+            // This CAS success is the linearization point: xNextRef is now the removed
+            // global minimum (paper's reassigned "x" at line 12 / new_head at line 13).
+            offset++;
+            Node<V> newHead = xNextRef;
+            size.decrementAndGet();
+
+            if (offset > MAX_OFFSET) {
+                // Paper lines 14-15: batched physical deletion, Linden-Jonsson style --
+                // swing head straight past the whole logically-deleted prefix in one
+                // store, abandoning every skipped dead node at once. A plain store (not a
+                // CAS) is both faithful to the paper and safe: every other mutator's
+                // relink CAS (insert's front CAS at head.next, and search's /
+                // searchDelete's / searchPhysDel's unlink CASes) requires a
+                // logdel-cleared expected stamp on head.next and simply fails/retries
+                // against a logdel'd head -- and per search()'s own guard
+                // (isRightMovingOrLeftLogdel), no insert can ever complete using a
+                // logdel'd node as its left predecessor, so nothing can have spliced
+                // itself into the prefix being collapsed here. Combined with delete-min's
+                // own global serialization, no concurrent writer can be racing this store.
+                head.next.set(newHead, LOGDEL_BIT);
+            }
+
+            return newHead;
+        }
     }
 
     /**
