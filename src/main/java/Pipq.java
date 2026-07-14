@@ -1,5 +1,4 @@
 import java.util.Optional;
-import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * Faithful Java baseline of the original PIPQ algorithmic structure.
@@ -27,7 +26,7 @@ public final class Pipq<V> {
     private final int[] leaderCounters;
     private final int cntrMin;
     private final int cntrMax;
-    private final ReentrantLock deleteMinLock = new ReentrantLock();
+    private final CasLock coordinatorLock = new CasLock();
     private final PipqStats stats = new PipqStats();
 
     public Pipq(int numberOfThreads, int cntrMin, int cntrMax) {
@@ -59,6 +58,7 @@ public final class Pipq<V> {
         this.cntrMax = cntrMax;
     }
 
+    // TTODO: fix
     public void insert(int tid, long key, V value) {
         validateTid(tid);
         stats.recordTotalInsert();
@@ -111,27 +111,38 @@ public final class Pipq<V> {
         validateTid(tid);
         stats.recordTotalDeleteMin();
 
-        deleteMinLock.lock();
-        try {
-            Node<V> removed;
-            int ownerTid;
+        while (true) {
+            if (coordinatorLock.tryLock()) {
+                try {
+                    Node<V> removed;
+                    int ownerTid;
 
-            stats.recordLeaderDeleteMin();
-            removed = leader.deleteMin();
-            if (removed == null) {
-                return Optional.empty();
+                    stats.recordLeaderDeleteMin();
+                    removed = leader.deleteMin();
+                    if (removed == null) {
+                        return Optional.empty();
+                    }
+
+                    ownerTid = removed.tid();
+                    if (leaderCounters[ownerTid] <= 0) {
+                        throw new IllegalStateException("leader counter for tid " + ownerTid + " is already zero");
+                    }
+                    leaderCounters[ownerTid]--;
+
+                    promoteFromWorkerIfCounterBelow(ownerTid, REQUIRED_LEADER_MINIMUM);
+                    return Optional.of(removed);
+                } finally {
+                    coordinatorLock.unlock();
+                }
             }
 
-            ownerTid = removed.tid();
-            if (leaderCounters[ownerTid] <= 0) {
-                throw new IllegalStateException("leader counter for tid " + ownerTid + " is already zero");
-            }
-            leaderCounters[ownerTid]--;
+            // Lost the race for the coordinator lock — help instead of blocking.
+            helpUpsert(tid);
 
-            promoteFromWorkerIfCounterBelow(ownerTid, REQUIRED_LEADER_MINIMUM);
-            return Optional.of(removed);
-        } finally {
-            deleteMinLock.unlock();
+            // TODO: paper's Delete-Min (Algorithm ~9-10) has the waiting thread check an
+            // announce-array slot here to see whether the current coordinator already
+            // completed this thread's delete-min while combining, and return that result
+            // instead of retrying. Announce array not implemented yet — always retry.
         }
     }
 
@@ -144,7 +155,9 @@ public final class Pipq<V> {
      */
     public boolean helpUpsert(int tid) {
         validateTid(tid);
-        return promoteFromWorkerIfCounterBelow(tid, cntrMin);
+        // TODO: implement Help-Upsert (Algorithm 11): promote this thread's worker-heap
+        // min into the leader if leaderCounters[tid] < cntrMin. Stubbed for now.
+        throw new UnsupportedOperationException("helpUpsert not yet implemented");
     }
 
     public PipqStats stats() {

@@ -1,6 +1,5 @@
 import java.util.Arrays;
 import java.util.Objects;
-import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * Custom array-backed binary min-heap used for the PIPQ worker level.
@@ -12,7 +11,7 @@ import java.util.concurrent.locks.ReentrantLock;
 public final class WorkerHeap<V> {
     private static final int DEFAULT_CAPACITY = 16;
 
-    private final ReentrantLock lock = new ReentrantLock();
+    private final CasLock lock = new CasLock();
     private Node<V>[] heap;
     private int size;
 
