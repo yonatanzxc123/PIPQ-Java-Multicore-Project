@@ -11,6 +11,7 @@ public final class PipqStats {
     private final LongAdder leaderDeleteMaxByThread = new LongAdder();
     private final LongAdder workerHeapInserts = new LongAdder();
     private final LongAdder workerHeapDeleteMinPromotions = new LongAdder();
+    private final LongAdder helpUpserts = new LongAdder();
 
     void recordTotalInsert() {
         totalInserts.increment();
@@ -52,6 +53,10 @@ public final class PipqStats {
         workerHeapDeleteMinPromotions.increment();
     }
 
+    void recordHelpUpsert() {
+        helpUpserts.increment();
+    }
+
     public long totalInserts() {
         return totalInserts.sum();
     }
@@ -90,5 +95,9 @@ public final class PipqStats {
 
     public long workerHeapDeleteMinPromotions() {
         return workerHeapDeleteMinPromotions.sum();
+    }
+
+    public long helpUpserts() {
+        return helpUpserts.sum();
     }
 }

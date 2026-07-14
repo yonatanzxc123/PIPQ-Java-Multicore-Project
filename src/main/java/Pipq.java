@@ -155,9 +155,32 @@ public final class Pipq<V> {
      */
     public boolean helpUpsert(int tid) {
         validateTid(tid);
-        // TODO: implement Help-Upsert (Algorithm 11): promote this thread's worker-heap
-        // min into the leader if leaderCounters[tid] < cntrMin. Stubbed for now.
-        throw new UnsupportedOperationException("helpUpsert not yet implemented");
+        if (leaderCounters[tid] >= cntrMin) {
+            return false;
+        }
+
+        WorkerHeap<V> heap = workerHeaps[tid];
+        if (!heap.tryLock()) {
+            // Heap busy (owner mid-insert/delete-min) — don't block, just skip this round.
+            return false;
+        }
+        try {
+            if (leaderCounters[tid] >= cntrMin) {
+                return false;
+            }
+
+            Node<V> promoted = heap.deleteMinUnlocked();
+            if (promoted == null) {
+                return false;
+            }
+
+            insertIntoLeader(promoted);
+            leaderCounters[tid]++;
+            stats.recordHelpUpsert();
+            return true;
+        } finally {
+            heap.unlock();
+        }
     }
 
     public PipqStats stats() {

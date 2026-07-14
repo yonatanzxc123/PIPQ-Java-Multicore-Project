@@ -35,6 +35,10 @@ public final class WorkerHeap<V> {
         lock.unlock();
     }
 
+    public boolean tryLock() {
+        return lock.tryLock();
+    }
+
     public void insert(Node<V> node) {
         lock();
         try {
