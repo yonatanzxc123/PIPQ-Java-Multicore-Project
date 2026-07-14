@@ -12,10 +12,9 @@ import java.util.concurrent.atomic.AtomicStampedReference;
  * successor of this node is logically deleted (set on the predecessor, Linden-style);
  * bit 1 ({@code moving}) means this node itself is being moved by a concurrent
  * by-thread delete (set on the node itself, Harris-style). {@code search}, {@code insert}
- * (with {@code lead_largest} tracking), and {@code maxByThread} are implemented here;
- * {@code deleteMin}/{@code deleteMaxByThread} are ported in later passes — note
- * {@code maxByThread} will go stale once {@code deleteMaxByThread} exists unless that
- * pass also resets/recomputes {@code maxPerTid[tid]}.</p>
+ * (with {@code lead_largest} tracking), {@code maxByThread}, and {@code deleteMaxByThread}
+ * (with its {@code searchDelete}/{@code searchPhysDel} helpers) are implemented here;
+ * {@code deleteMin} is ported in a later pass.</p>
  */
 public class LeaderLinkedList<V> implements LeaderLayer<V> {
     private static final int LOGDEL_BIT = 1;
@@ -60,10 +59,6 @@ public class LeaderLinkedList<V> implements LeaderLayer<V> {
 
             node.next = new AtomicStampedReference<>(right, 0);
 
-            // search() guarantees left.next == (right, 0) [no logdel/moving bits] at the
-            // moment it returns; mirrors harris_insert's CAS(&left->next, right, newnode)
-            // on the raw (unmarked) pointer. If it has since changed, CAS fails and we
-            // retry the whole search from head, exactly like the C++ do/while.
             if (left.next.compareAndSet(right, node, 0, 0)) {
                 size.incrementAndGet();
                 updateLargestByThread(node);
@@ -72,12 +67,6 @@ public class LeaderLinkedList<V> implements LeaderLayer<V> {
         }
     }
 
-    /**
-     * Ported from {@code L-Insert} lines 6-7 (paper pseudocode) / {@code harris_insert}'s
-     * {@code last_ptr->largest_ptr} update (harris.cc:383). Each tid's slot is only ever
-     * written by that tid's own insert calls, so a plain array write is safe — same
-     * single-writer assumption the paper's {@code LeaderLargest} struct relies on.
-     */
     private void updateLargestByThread(Node<V> node) {
         Node<V> currentLargest = maxPerTid[node.tid()];
         if (currentLargest == null || node.key() > currentLargest.key()) {
@@ -90,9 +79,52 @@ public class LeaderLinkedList<V> implements LeaderLayer<V> {
         throw new UnsupportedOperationException("not yet implemented");
     }
 
+    /**
+     * Ported from {@code L-DeleteMaxP} (Algorithm 4 lines 1-13, paper p.12). Removes and
+     * returns the node tagged {@code tid} with the largest key currently in the list — used
+     * by the slowest insert path to make room for a new node before pushing it into the list.
+     * Returns {@code null} if {@code tid} currently has no node in the list.
+     *
+     * <p>Correctness relies on {@code maxPerTid[tid]} being single-writer (only thread
+     * {@code tid} ever inserts/removes its own tid-tagged nodes) — see class javadoc and
+     * {@link #updateLargestByThread}. {@code startLeadLargest} is captured once, up front,
+     * and reused across every {@code searchDelete} retry (mirrors the paper's fixed
+     * {@code start_lead_largest} local, reused across the {@code repeat} at line 3).</p>
+     */
     @Override
     public Node<V> deleteMaxByThread(int tid) {
-        throw new UnsupportedOperationException("not yet implemented");
+        Node<V> startLeadLargest = maxPerTid[tid];
+        if (startLeadLargest == null) {
+            return null;
+        }
+
+        Node<V> lNode;
+        Node<V> rNode;
+        Node<V> rNodeNextRef;
+        while (true) {
+            Window<V> w = searchDelete(tid, startLeadLargest);
+            lNode = w.left();
+            rNode = w.right();
+
+            int[] rNextStamp = new int[1];
+            rNodeNextRef = rNode.next.get(rNextStamp);
+            if (!isMarked(rNextStamp[0])
+                    && rNode.next.compareAndSet(rNodeNextRef, rNodeNextRef, rNextStamp[0], rNextStamp[0] | MOVING_BIT)) {
+                break;
+            }
+            // r_node was already marked (moving/logdel) by someone else, or lost the CAS
+            // race -> retry the whole searchDelete to find the current target.
+        }
+
+        size.decrementAndGet();
+
+        int[] lNextStamp = new int[1];
+        lNode.next.get(lNextStamp);
+        int expectedLStamp = lNextStamp[0] & ~LOGDEL_BIT;
+        if (!lNode.next.compareAndSet(rNode, rNodeNextRef, expectedLStamp, expectedLStamp)) {
+            searchPhysDel(rNode);
+        }
+        return rNode;
     }
 
     @Override
@@ -204,5 +236,131 @@ public class LeaderLinkedList<V> implements LeaderLayer<V> {
         boolean rightMoving = right != tail && right.movedBit();
         boolean leftLogdel = left.delBit();
         return rightMoving || leftLogdel;
+    }
+
+    private static boolean isMarked(int stamp) {
+        return (stamp & (LOGDEL_BIT | MOVING_BIT)) != 0;
+    }
+
+    /**
+     * Ported from {@code searchDelete} (Algorithm 4 lines 14-47, paper p.12), the by-thread
+     * variant of {@link #search}. Walks from {@code head}, tracking the running non-moving
+     * predecessor candidate exactly like {@code search()}'s {@code left}/{@code leftNext}
+     * (here {@code curLNode}/{@code curLNodeNext}/{@code curLNodeNextStamp}), and additionally
+     * remembers the most recently seen {@code tid}-tagged node as {@code rNode} (with its own
+     * non-moving predecessor snapshot as {@code lNode}/{@code lNodeNext}/{@code lNodeNextStamp})
+     * until the walk reaches {@code startLeadLargest} — the node {@link #deleteMaxByThread}
+     * intends to remove. {@code newLeadLargest} accumulates the tid-tagged node found just
+     * before {@code rNode}, i.e. what becomes tid's new largest once {@code rNode} is gone; it
+     * is written into {@code maxPerTid[tid]} before returning, mirroring the paper's
+     * {@code lead_largest ← new_lead_largest} (line 35).
+     *
+     * <p>{@code maxPerTid[tid]} is only ever written by thread {@code tid} itself (here, and
+     * in {@link #updateLargestByThread} on insert), so the plain array write is safe — same
+     * single-writer assumption as elsewhere in this class.</p>
+     */
+    Window<V> searchDelete(int tid, Node<V> startLeadLargest) {
+        while (true) {
+            Node<V> curLNode = head;
+            int[] curLNodeNextStamp = new int[1];
+            Node<V> curLNodeNext = head.next.get(curLNodeNextStamp);
+            curLNodeNextStamp[0] &= ~LOGDEL_BIT;
+
+            Node<V> lNode = null;
+            Node<V> lNodeNext = null;
+            int lNodeNextStamp = 0;
+            Node<V> rNode = null;
+            Node<V> newLeadLargest = null;
+
+            Node<V> x = head;
+            int[] xNextStamp = new int[1];
+            Node<V> xNext = x.next.get(xNextStamp);
+
+            while (true) {
+                if ((xNextStamp[0] & MOVING_BIT) == 0) {
+                    curLNode = x;
+                    curLNodeNext = xNext;
+                    curLNodeNextStamp[0] = xNextStamp[0] & ~LOGDEL_BIT;
+                }
+                x = xNext;
+                if (x == tail) {
+                    break;
+                }
+                xNext = x.next.get(xNextStamp);
+                if ((xNextStamp[0] & MOVING_BIT) == 0 && x.tid() == tid) {
+                    newLeadLargest = rNode;
+                    lNode = curLNode;
+                    lNodeNext = curLNodeNext;
+                    lNodeNextStamp = curLNodeNextStamp[0];
+                    rNode = x;
+                    if (x == startLeadLargest) {
+                        break;
+                    }
+                }
+            }
+
+            maxPerTid[tid] = newLeadLargest;
+
+            if (lNodeNext == rNode) {
+                return new Window<>(lNode, rNode);
+            }
+
+            if (lNode.next.compareAndSet(lNodeNext, rNode, lNodeNextStamp, lNodeNextStamp)) {
+                return new Window<>(lNode, rNode);
+            }
+            // CAS lost the race (l_node's stamp/reference changed) -> retry from head.
+        }
+    }
+
+    /**
+     * Ported from {@code searchPhysDel} (Algorithm 4 lines 48-73, paper p.12). Physically
+     * unlinks {@code searchNode} once its stable (non-moving, non-logically-deleted)
+     * predecessor is located — the fallback {@link #deleteMaxByThread} calls when its direct
+     * {@code l_node}/{@code r_node} unlink CAS loses a race. If {@code searchNode} is no
+     * longer found in the list, another thread has already physically unlinked it and this is
+     * a no-op, matching the paper's "search_node has been removed by another thread" case.
+     */
+    void searchPhysDel(Node<V> searchNode) {
+        while (true) {
+            Node<V> lNode = head;
+            int[] lNodeNextStamp = new int[1];
+            Node<V> lNodeNext = head.next.get(lNodeNextStamp);
+            lNodeNextStamp[0] &= ~LOGDEL_BIT;
+
+            boolean found = false;
+            boolean prevLogdel;
+
+            Node<V> x = head;
+            int[] xNextStamp = new int[1];
+            Node<V> xNext = x.next.get(xNextStamp);
+
+            do {
+                if ((xNextStamp[0] & MOVING_BIT) == 0) {
+                    lNode = x;
+                    lNodeNext = xNext;
+                    lNodeNextStamp[0] = xNextStamp[0] & ~LOGDEL_BIT;
+                }
+                x = xNext;
+                if (x == tail) {
+                    break;
+                }
+                if (x == searchNode) {
+                    found = true;
+                }
+                prevLogdel = (xNextStamp[0] & LOGDEL_BIT) != 0;
+                xNext = x.next.get(xNextStamp);
+            } while (!(found && (xNextStamp[0] & MOVING_BIT) == 0 && !prevLogdel));
+
+            if (!found) {
+                return;
+            }
+
+            Node<V> rNode = x;
+
+            if (lNode.next.compareAndSet(lNodeNext, rNode, lNodeNextStamp[0], lNodeNextStamp[0])) {
+                return;
+            }
+            // CAS lost the race -> retry from head.
+        }
     }
 }
