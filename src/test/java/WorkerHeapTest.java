@@ -30,8 +30,9 @@ class WorkerHeapTest {
             popped++;
         }
 
-        // Duplicate keys (both "1") compare equal (paper: undefined order among ties) --
-        // only overall key order is asserted; which of "one"/"one-again" pops first is not.
+        // The two nodes with key 1 compare as equal, and the paper leaves the order among
+        // such ties undefined. So this test only asserts the overall key order below -- it
+        // does not check which of "one"/"one-again" comes out first.
         assertEquals(Arrays.asList(1L, 1L, 3L, 5L), keys);
         assertEquals(new HashSet<>(Arrays.asList("one", "one-again")), tiedValues);
         assertNull(heap.deleteMin());

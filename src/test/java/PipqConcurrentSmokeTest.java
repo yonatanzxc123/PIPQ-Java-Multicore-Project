@@ -20,14 +20,17 @@ class PipqConcurrentSmokeTest {
         assertTimeoutPreemptively(Duration.ofSeconds(10), () -> {
             int threads = 4;
             int operationsPerThread = 750;
-            // CNTR_MIN/CNTR_MAX need a real gap (paper defaults: 10/100): the slowest insert
-            // path's leader-counter bookkeeping intentionally nets to zero around its fused
-            // insert+evict (matching the paper's harris_insert_and_move, which never touches
-            // the counter there either), relying on the >=2-invariant holding long enough for
-            // a concurrent deleteMin not to drain a thread's leader-list membership to nothing
-            // in between. At a tiny gap (e.g. 2/4) that race is easy to hit under real
-            // concurrency and trips Pipq#executeAnnouncedDeleteMin's negative-counter guard --
-            // a known, paper-inherited limitation, not a bug in this test's own logic.
+            // CNTR_MIN and CNTR_MAX need a real gap between them here (the paper's defaults
+            // are 10/100). Here's why: on the slowest insert path, one node goes into the
+            // leader list and one comes out in the same fused insert+evict step, so the leader
+            // counter for that thread is left unchanged (matching the paper's
+            // harris_insert_and_move, which doesn't touch the counter there either). That's
+            // only correct if the paper's >=2-per-thread invariant holds throughout — i.e. a
+            // concurrent deleteMin doesn't have time to drain that thread's leader-list node
+            // count to zero in between. With a tiny gap (e.g. 2/4) that race becomes easy to
+            // hit under real concurrency and trips the negative-counter guard in
+            // Pipq#executeAnnouncedDeleteMin. That's a known limitation inherited from the
+            // paper's own design, not a bug in this test.
             Pipq<String> pipq = new Pipq<>(threads, 10, 50);
             pipq.setLogger(new ConcurrentLogger());
             ExecutorService executor = Executors.newFixedThreadPool(threads);

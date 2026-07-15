@@ -1,10 +1,11 @@
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * CAS-based mutual exclusion lock matching the paper's {@code lock_val} scheme: a version
- * counter where an even value means unlocked and an odd value means locked. Acquiring CASes
- * the counter from even {@code v} to {@code v + 1}; releasing bumps it again ({@code v + 1} to
- * {@code v + 2}, back to even). Not reentrant.
+ * CAS-based mutual exclusion lock, matching the paper's {@code lock_val}: a single
+ * counter where an even value means "unlocked" and an odd value means "locked". Acquiring the
+ * lock does a compare-and-set from an even value {@code v} to {@code v + 1} (now odd, i.e.
+ * locked). Releasing the lock bumps the counter again, from {@code v + 1} to {@code v + 2}
+ * (back to even, i.e. unlocked). This lock is not reentrant.
  */
 public final class CasLock {
     private final AtomicInteger lockVal = new AtomicInteger(0);
@@ -19,7 +20,7 @@ public final class CasLock {
 
     public void lock() {
         while (!tryLock()) {
-            // busy-wait
+            // Spin: keep retrying tryLock() until it succeeds.
         }
     }
 

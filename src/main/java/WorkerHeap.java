@@ -4,9 +4,11 @@ import java.util.Objects;
 /**
  * Custom array-backed binary min-heap used for the PIPQ worker level.
  *
- * <p>Each logical thread owns one heap. The owning thread performs most inserts
- * locally, while delete-min repair may briefly access another thread's heap to
- * promote its minimum element back into the leader layer.</p>
+ * <p>Each logical thread owns one heap. The owning thread performs most inserts locally
+ * without touching any shared state. Occasionally, when a delete-min needs to refill the
+ * leader list, another thread ("coordinator") briefly accesses this heap to move its minimum element up into
+ * the leader layer - that's why the heap has its own lock rather than assuming single-thread
+ * access.</p>
  */
 public final class WorkerHeap<V> {
     private static final int DEFAULT_CAPACITY = 16;
@@ -79,18 +81,19 @@ public final class WorkerHeap<V> {
         return size() == 0;
     }
 
-    void insertUnlocked(Node<V> node) {
+    public void insertUnlocked(Node<V> node) {
         Objects.requireNonNull(node, "node");
-        // Do NOT touch node.next here: WorkerHeap is array-based and never reads it, but the
-        // same Node object may still be reachable from a concurrent LeaderLinkedList traversal
-        // (e.g. a lagging search()/searchDelete() on another thread) if this node was just
-        // evicted from L and handed straight to a worker heap (Pipq's slowest-path/promotion
-        // paths). Nulling next here would corrupt that in-flight lock-free traversal.
+        // Do not touch node.next here. WorkerHeap is array-based and never reads that field
+        // itself, but the same Node object can still be reachable from a concurrent
+        // LeaderLinkedList traversal — for example a search()/searchDelete() on another thread
+        // that is lagging behind — if this node was just evicted from the leader list and
+        // handed straight to a worker heap (this happens on Pipq's slowest-path and promotion
+        // paths). Overwriting next here would corrupt that in-flight lock-free traversal.
         ensureCapacity(size + 1);
 
         int idx = size;
         while (idx > 0) {
-            int parent = parent(idx);
+            int parent = parentIdx(idx);
             Node<V> parentNode = heap[parent];
             if (Node.compare(parentNode, node) <= 0) {
                 break;
@@ -103,7 +106,7 @@ public final class WorkerHeap<V> {
         size++;
     }
 
-    Node<V> deleteMinUnlocked() {
+    public Node<V> deleteMinUnlocked() {
         if (size == 0) {
             return null;
         }
@@ -116,15 +119,16 @@ public final class WorkerHeap<V> {
             siftDown(last);
         }
 
-        // See insertUnlocked: min.next is deliberately left untouched, for the same reason.
+        // min.next is deliberately left untouched here, for the same reason explained in
+        // insertUnlocked above.
         return min;
     }
 
-    Node<V> peekMinUnlocked() {
+    public Node<V> peekMinUnlocked() {
         return size == 0 ? null : heap[0];
     }
 
-    int sizeUnlocked() {
+    public int sizeUnlocked() {
         return size;
     }
 
@@ -133,7 +137,7 @@ public final class WorkerHeap<V> {
         int half = size / 2;
 
         while (idx < half) {
-            int left = leftChild(idx);
+            int left = leftChildIdx(idx);
             int right = left + 1;
             int smallerChild = left;
 
@@ -161,11 +165,11 @@ public final class WorkerHeap<V> {
         heap = Arrays.copyOf(heap, newCapacity);
     }
 
-    private static int parent(int idx) {
+    private static int parentIdx(int idx) {
         return (idx - 1) >>> 1;
     }
 
-    private static int leftChild(int idx) {
+    private static int leftChildIdx(int idx) {
         return (idx << 1) + 1;
     }
 }

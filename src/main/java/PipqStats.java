@@ -1,5 +1,11 @@
 import java.util.concurrent.atomic.LongAdder;
 
+/**
+ * Counters for how often each PIPQ operation and insert path is taken. Useful for
+ * reproducing the paper's Figure 5 (the distribution of fast/slower/slowest insert paths)
+ * All counters use {@link LongAdder} for low-contention concurrent
+ * updates from many threads.
+ */
 public final class PipqStats {
     private final LongAdder totalInserts = new LongAdder();
     private final LongAdder totalDeleteMins = new LongAdder();

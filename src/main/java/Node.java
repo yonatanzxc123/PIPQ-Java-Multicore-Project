@@ -2,19 +2,31 @@ import java.util.Objects;
 import java.util.concurrent.atomic.AtomicStampedReference;
 
 /**
- * Element stored by both PIPQ levels.
+ * Element stored at both PIPQ levels (worker heap and leader list).
  *
- * <p>The paper stores key/value pairs in worker heaps and key/value/tid tuples in
- * the leader list. The Java baseline keeps the original inserting thread id on
- * every node so elements can move between levels without losing ownership.
- * Equal-key nodes compare equal (paper: duplicates in undefined order).</p>
+ * <p>The paper stores plain key/value pairs in worker heaps, and key/value/tid triples in the
+ * leader list. This class simplifies that by keeping the original inserting thread's
+ * id ({@code tid}) on every node, in both places, so an element can move between levels
+ * without losing track of which thread it belongs to. Nodes with equal keys compare as equal;
+ * the paper leaves the order among such duplicates undefined, so this is a safe choice.</p>
+ * <ul>
+ *   <li>bit 0, {@code logdel} — set on a node's {@code next} pointer to mean "this node's
+ *       successor has been logically deleted" (Linden-style: the flag lives on the
+ *       predecessor, not on the deleted node itself).</li>
+ *   <li>bit 1, {@code moving} — set on a node's own {@code next} pointer to mean "this node
+ *       is currently being moved by a concurrent by-thread delete" (Harris-style: the flag
+ *       lives on the node being removed).</li>
+ * </ul>
  */
 public final class Node<V> implements Comparable<Node<V>> {
+    public static final int LOGDEL_BIT = 1;
+    public static final int MOVING_BIT = 2;
+
     private final long key;
     private final V value;
     private final int tid;
 
-    public AtomicStampedReference<Node<V>> next;
+    private AtomicStampedReference<Node<V>> next;
 
     public Node(long key, V value, int tid) {
         this(key, value, tid, false);
@@ -29,7 +41,7 @@ public final class Node<V> implements Comparable<Node<V>> {
         this.tid = tid;
     }
 
-    static <V> Node<V> sentinel(long key) {
+    public static <V> Node<V> sentinel(long key) {
         return new Node<>(key, null, -1, true);
     }
 
@@ -45,20 +57,30 @@ public final class Node<V> implements Comparable<Node<V>> {
         return tid;
     }
 
-    // whether THIS node is moved
-    public boolean movedBit()
-    {
-        int[] stampHolder = new int[1];
-        Node<V> n = next.get(stampHolder);
-        return (stampHolder[0] & 2) != 0;
+    public AtomicStampedReference<Node<V>> next() {
+        return next;
     }
 
-    // whether NEXT node is logically deleted
+    public void setNext(Node<V> nextNode, int stamp) {
+        this.next = new AtomicStampedReference<>(nextNode, stamp);
+    }
+
+    // True if this node's successor has been logically deleted (the LOGDEL bit, set on this
+    // node's next pointer to mark the *next* node as removed). applies to deleteMin
     public boolean delBit()
     {
         int[] stampHolder = new int[1];
-        Node<V> n = next.get(stampHolder);
+        next.get(stampHolder);
         return (stampHolder[0] & 1) != 0;
+    }
+
+    // True if this node itself is currently being moved by a concurrent deleteMaxByThread
+    // (the MOVING bit, set on the node's own next pointer).
+    public boolean movedBit()
+    {
+        int[] stampHolder = new int[1];
+        next.get(stampHolder);
+        return (stampHolder[0] & 2) != 0;
     }
 
     @Override

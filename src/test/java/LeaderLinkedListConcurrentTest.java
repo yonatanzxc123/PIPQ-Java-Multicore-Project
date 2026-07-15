@@ -20,23 +20,23 @@ import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Concurrency smoke tests for {@link LeaderLinkedList} in isolation, before it is wired
- * into a {@link Pipq}. Structural checks only.
+ * Concurrency smoke tests for {@link LeaderLinkedList} on its own, before it is wired into a
+ * {@link Pipq}. These are structural checks only.
  *
- * <p>The >=2-elements-per-thread correctness invariant (Lemma 2/4 in the paper -- see
- * {@link LeaderLayer}'s per-tid mutual-exclusion contract and {@code deleteMin()}'s javadoc)
- * is {@code Pipq}'s job to maintain via its leader counters, not the list's own job. So none
- * of these tests ever run {@code deleteMin()} concurrently with {@code deleteMaxByThread()} --
- * doing so without the invariant maintained could race the LOGDEL and MOVING bits on the same
- * node from two different physical fields (predecessor's {@code next} vs. the node's own
- * {@code next}), which is exactly the hazard the invariant exists to rule out. See
- * {@code PipqConcurrentSmokeTest} for that combined, invariant-respecting coverage once a
- * {@code Pipq} owns the counters.</p>
+ * <p>Maintaining the paper's >=2-elements-per-thread correctness invariant (Lemma 2/4 — see
+ * {@link LeaderLayer}'s per-tid mutual-exclusion contract and {@code deleteMin()}'s javadoc) is
+ * {@code Pipq}'s job, done through its leader counters — it isn't something the list itself
+ * enforces. So none of the tests here ever run {@code deleteMin()} concurrently with {@code
+ * deleteMaxByThread()}: doing so without that invariant in place could let the LOGDEL and
+ * MOVING bits race on the same node, set through two different physical fields (the
+ * predecessor's {@code next} versus the node's own {@code next}) — exactly the hazard the
+ * invariant exists to prevent. See {@code PipqConcurrentSmokeTest} for combined coverage that
+ * does respect the invariant, once a {@code Pipq} is managing the counters.</p>
  *
- * <p>Every test uses thread-per-tid ownership -- each thread only ever calls {@code insert}/
- * {@code maxByThread}/{@code deleteMaxByThread} for its own {@code tid} -- which trivially
- * satisfies {@link LeaderLayer}'s per-tid mutual-exclusion contract without needing a
- * {@code WorkerHeap} or any lock object.</p>
+ * <p>Every test here uses one thread per {@code tid}: each thread only ever calls {@code
+ * insert}/{@code maxByThread}/{@code deleteMaxByThread} for its own {@code tid}. That alone
+ * trivially satisfies {@link LeaderLayer}'s per-tid mutual-exclusion contract, without needing
+ * a {@code WorkerHeap} or any separate lock object.</p>
  */
 class LeaderLinkedListConcurrentTest {
     @Test
@@ -109,8 +109,9 @@ class LeaderLinkedListConcurrentTest {
                 });
             }
 
-            // Sole caller of deleteMin() for the whole test -- deleteMin() is only
-            // documented safe under external global serialization (see its javadoc).
+            // This is the only thread calling deleteMin() in this test -- deleteMin() is only
+            // documented as safe when calls to it are serialized across the whole program
+            // (see its javadoc).
             Callable<Void> drainer = () -> {
                 start.await();
                 while (!insertingDone.get()) {
@@ -133,8 +134,8 @@ class LeaderLinkedListConcurrentTest {
             drainFuture.get();
             executor.shutdownNow();
 
-            // Drain whatever the concurrent drainer didn't get to -- single-threaded now, and
-            // no further inserts happen, so this tail is expected to come out sorted.
+            // Drain whatever the concurrent drainer didn't get to. This runs single-threaded,
+            // after all inserts have finished, so this tail is expected to come out sorted.
             List<Long> afterKeys = new ArrayList<>();
             Node<String> node;
             while ((node = leader.deleteMin()) != null) {
@@ -205,8 +206,8 @@ class LeaderLinkedListConcurrentTest {
                 }
             }
 
-            // Single-threaded final drain -- safe to combine with the deleteMaxByThread
-            // history above since no deleteMaxByThread calls are still in flight.
+            // Final drain, single-threaded. Safe to compare against the deleteMaxByThread
+            // history collected above, since no deleteMaxByThread calls are still running.
             List<Long> drained = new ArrayList<>();
             Node<String> node;
             while ((node = leader.deleteMin()) != null) {
