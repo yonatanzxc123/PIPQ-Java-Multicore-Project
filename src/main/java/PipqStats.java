@@ -12,6 +12,7 @@ public final class PipqStats {
     private final LongAdder workerHeapInserts = new LongAdder();
     private final LongAdder workerHeapDeleteMinPromotions = new LongAdder();
     private final LongAdder helpUpserts = new LongAdder();
+    private final LongAdder fastPathUpserts = new LongAdder();
 
     void recordTotalInsert() {
         totalInserts.increment();
@@ -57,6 +58,10 @@ public final class PipqStats {
         helpUpserts.increment();
     }
 
+    void recordFastPathUpsert() {
+        fastPathUpserts.increment();
+    }
+
     public long totalInserts() {
         return totalInserts.sum();
     }
@@ -99,5 +104,9 @@ public final class PipqStats {
 
     public long helpUpserts() {
         return helpUpserts.sum();
+    }
+
+    public long fastPathUpserts() {
+        return fastPathUpserts.sum();
     }
 }

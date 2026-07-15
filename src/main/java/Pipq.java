@@ -1,4 +1,5 @@
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicIntegerArray;
 
 /**
  * Faithful Java baseline of the original PIPQ algorithmic structure.
@@ -23,11 +24,29 @@ public final class Pipq<V> {
 
     private final WorkerHeap<V>[] workerHeaps;
     private final LeaderLinkedList<V> leader;
-    private final int[] leaderCounters;
+    private final AtomicIntegerArray leaderCounters;
+    private final AnnounceSlot<V>[] announce;
     private final int cntrMin;
     private final int cntrMax;
     private final CasLock coordinatorLock = new CasLock();
     private final PipqStats stats = new PipqStats();
+
+    /**
+     * One per thread (paper's {@code AnnounceStruct}, Algorithm 2). A thread announces a pending
+     * delete-min by setting {@link #status} true; the coordinator publishes {@link #result} and
+     * then clears {@code status} to signal completion. {@code status} keeps the paper's polarity
+     * ({@code true} == pending, {@code false} == served). Reused across calls — a thread's
+     * delete-mins never overlap.
+     *
+     * <p>Visibility: the coordinator writes {@code result} (plain) before {@code status = false}
+     * (volatile); the announcer reads {@code status} (volatile) before {@code result}. The
+     * coordinator always writes {@code result} in both branches of
+     * {@link Pipq#executeAnnouncedDeleteMin}, so the announcer never observes a stale value.</p>
+     */
+    private static final class AnnounceSlot<V> {
+        volatile boolean status;
+        Node<V> result;
+    }
 
     public Pipq(int numberOfThreads, int cntrMin, int cntrMax) {
         this(DEFAULT_WORKER_HEAP_CAPACITY, numberOfThreads, cntrMin, cntrMax);
@@ -53,12 +72,27 @@ public final class Pipq<V> {
             workerHeaps[i] = new WorkerHeap<>(initialWorkerHeapCapacity);
         }
         this.leader = new LeaderLinkedList<>(numberOfThreads);
-        this.leaderCounters = new int[numberOfThreads];
+        this.leaderCounters = new AtomicIntegerArray(numberOfThreads);
+        this.announce = (AnnounceSlot<V>[]) new AnnounceSlot<?>[numberOfThreads];
+        for (int i = 0; i < numberOfThreads; i++) {
+            announce[i] = new AnnounceSlot<>();
+        }
         this.cntrMin = cntrMin;
         this.cntrMax = cntrMax;
     }
 
-    // TTODO: fix
+    /**
+     * PIPQ-Insert (Algorithm 8), in the paper's literal branch order: the leader-vs-fast decision
+     * (line 7) is the outer {@code if}, with the {@code CNTR_MAX} check (line 9) and the
+     * fast/slowest split (line 10) nested inside it, and the plain fast path (line 22) as the
+     * trailing {@code else}.
+     *
+     * <p>The trailing fast path also carries the C++ implementation's proactive top-up toward
+     * {@code CNTR_MIN} (from {@code hier_insert_local}; not present in the Algorithm 8 pseudocode
+     * itself) — after a plain worker insert, if this thread's leader count is below {@code
+     * CNTR_MIN}, its worker-min is popped and upserted into {@code L}. This keeps leader refill
+     * from being solely delete-min's job.</p>
+     */
     public void insert(int tid, long key, V value) {
         validateTid(tid);
         stats.recordTotalInsert();
@@ -66,40 +100,44 @@ public final class Pipq<V> {
         Node<V> node = new Node<>(key, value, tid);
         WorkerHeap<V> heap = workerHeaps[tid];
 
-        heap.lock();
+        heap.lock(); // Alg 8 lines 2-6: acquire lock_val (CasLock spins the CAS internally).
         try {
             Node<V> heapMin = heap.peekMinUnlocked();
-            if (heapMin != null && key >= heapMin.key()) {
+            if (heapMin == null || key < heapMin.key()) { // Alg 8 line 7, must compare with leader level
+                if (leaderCounters.get(tid) == cntrMax) { // Alg 8 line 9.
+                    Node<V> largest = leader.maxByThread(tid); // t_lead_largest
+                    if (largest != null && key >= largest.key()) { // Alg 8 lines 10-12: fast.
+                        insertIntoWorker(heap, node);
+                        stats.recordFastPathInsert();
+                    } else { // Alg 8 lines 13-17: slowest.
+                        insertIntoLeader(node);
+                        Node<V> movedDown = leader.deleteMaxByThread(tid);
+                        if (movedDown == null) {
+                            throw new IllegalStateException("leader counter indicated a node for tid "
+                                    + tid + " but deleteMaxByThread found none");
+                        }
+                        stats.recordLeaderDeleteMaxByThread();
+                        insertIntoWorker(heap, movedDown);
+                        stats.recordSlowestPathInsert();
+                    }
+                } else { // Alg 8 lines 18-21: slower.
+                    insertIntoLeader(node);
+                    leaderCounters.incrementAndGet(tid);
+                    stats.recordSlowerPathInsert();
+                }
+            } else { // Alg 8 lines 22-24: fast.
                 insertIntoWorker(heap, node);
                 stats.recordFastPathInsert();
-                return;
-            }
 
-            if (leaderCounters[tid] < cntrMax) {
-                insertIntoLeader(node);
-                leaderCounters[tid]++;
-                stats.recordSlowerPathInsert();
-                return;
+                // hier_insert_local top-up (C++ impl, not in Alg 8): keep L filled toward
+                // CNTR_MIN. Unlocked variant used because CasLock isn't reentrant and heap's
+                // lock is already held.
+                if (upsertFromWorkerUnlocked(tid, cntrMin)) {
+                    stats.recordFastPathUpsert();
+                }
             }
-
-            Node<V> worstLeaderForTid = leader.maxByThread(tid);
-            if (worstLeaderForTid != null && key >= worstLeaderForTid.key()) {
-                insertIntoWorker(heap, node);
-                stats.recordFastPathInsert();
-                return;
-            }
-
-            insertIntoLeader(node);
-            Node<V> movedDown = leader.deleteMaxByThread(tid);
-            if (movedDown == null) {
-                throw new IllegalStateException("leader counter indicated a node for tid " + tid
-                        + " but deleteMaxByThread found none");
-            }
-            stats.recordLeaderDeleteMaxByThread();
-            insertIntoWorker(heap, movedDown);
-            stats.recordSlowestPathInsert();
         } finally {
-            heap.unlock();
+            heap.unlock(); // Alg 8 line 26.
         }
     }
 
@@ -107,42 +145,79 @@ public final class Pipq<V> {
         insert(tid, key, value);
     }
 
+    /**
+     * PIPQ-DeleteMin (Algorithm 9). The thread announces its request, then competes to become the
+     * coordinator (paper's {@code TryCompeteCoordinator} + {@code TryBecomeCoordinator}, collapsed
+     * to a single zone: one {@link #coordinatorLock}). The winning coordinator serves every pending
+     * request via {@link #coordinate()} (combining); losers help maintain {@code L} while waiting,
+     * and return as soon as some coordinator has completed their own slot.
+     */
     public Optional<Node<V>> deleteMin(int tid) {
         validateTid(tid);
         stats.recordTotalDeleteMin();
 
-        while (true) {
+        AnnounceSlot<V> slot = announce[tid];
+        slot.status = true; // Algorithm 9 line 3: announce the operation.
+
+        while (slot.status) {
             if (coordinatorLock.tryLock()) {
                 try {
-                    Node<V> removed;
-                    int ownerTid;
-
-                    stats.recordLeaderDeleteMin();
-                    removed = leader.deleteMin();
-                    if (removed == null) {
-                        return Optional.empty();
-                    }
-
-                    ownerTid = removed.tid();
-                    if (leaderCounters[ownerTid] <= 0) {
-                        throw new IllegalStateException("leader counter for tid " + ownerTid + " is already zero");
-                    }
-                    leaderCounters[ownerTid]--;
-
-                    promoteFromWorkerIfCounterBelow(ownerTid, REQUIRED_LEADER_MINIMUM);
-                    return Optional.of(removed);
+                    coordinate(); // Drains all pending slots, including ours.
                 } finally {
                     coordinatorLock.unlock();
                 }
+                break;
             }
 
-            // Lost the race for the coordinator lock — help instead of blocking.
+            // Lost the race for the coordinator lock — help maintain L instead of blocking
+            // (Algorithm 9 lines 19/34), then re-check whether a coordinator has served us.
             helpUpsert(tid);
+        }
 
-            // TODO: paper's Delete-Min (Algorithm ~9-10) has the waiting thread check an
-            // announce-array slot here to see whether the current coordinator already
-            // completed this thread's delete-min while combining, and return that result
-            // instead of retrying. Announce array not implemented yet — always retry.
+        return Optional.ofNullable(slot.result);
+    }
+
+    /**
+     * Coordinator role (Algorithm 9 {@code Coordinate}), single-zone: drain every pending announce
+     * slot in one pass. Runs with {@link #coordinatorLock} held, so it is the only thread calling
+     * {@link LeaderLinkedList#deleteMin()} — satisfying that method's single-caller contract.
+     */
+    private void coordinate() {
+        for (int idx = 0; idx < announce.length; idx++) {
+            AnnounceSlot<V> slot = announce[idx];
+            if (slot.status) {
+                executeAnnouncedDeleteMin(idx);
+                slot.status = false; // Volatile write publishes result to the waiting thread.
+            }
+        }
+    }
+
+    /**
+     * Execute-Announced-DeleteMin (Algorithm 10). Pops the global minimum, decrements the removed
+     * element's owning thread's leader counter, publishes the result into that thread's announce
+     * slot, and — if the counter dropped below two — pulls an element up from the owner's worker
+     * heap to keep {@code L} populated.
+     */
+    private void executeAnnouncedDeleteMin(int idx) {
+        stats.recordLeaderDeleteMin();
+        Node<V> removed = leader.deleteMin();
+        AnnounceSlot<V> slot = announce[idx];
+
+        if (removed == null) {
+            slot.result = null; // EMPTY — the queue was empty.
+            return;
+        }
+
+        int ownerTid = removed.tid();
+        int after = leaderCounters.decrementAndGet(ownerTid); // add_and_fetch(cntr, -1)
+        if (after < 0) {
+            throw new IllegalStateException("leader counter for tid " + ownerTid + " went negative");
+        }
+
+        slot.result = removed;
+
+        if (after < REQUIRED_LEADER_MINIMUM) {
+            promoteFromWorkerIfCounterBelow(ownerTid, REQUIRED_LEADER_MINIMUM);
         }
     }
 
@@ -155,7 +230,7 @@ public final class Pipq<V> {
      */
     public boolean helpUpsert(int tid) {
         validateTid(tid);
-        if (leaderCounters[tid] >= cntrMin) {
+        if (leaderCounters.get(tid) >= cntrMin) {
             return false;
         }
 
@@ -165,19 +240,11 @@ public final class Pipq<V> {
             return false;
         }
         try {
-            if (leaderCounters[tid] >= cntrMin) {
-                return false;
+            if (upsertFromWorkerUnlocked(tid, cntrMin)) {
+                stats.recordHelpUpsert();
+                return true;
             }
-
-            Node<V> promoted = heap.deleteMinUnlocked();
-            if (promoted == null) {
-                return false;
-            }
-
-            insertIntoLeader(promoted);
-            leaderCounters[tid]++;
-            stats.recordHelpUpsert();
-            return true;
+            return false;
         } finally {
             heap.unlock();
         }
@@ -201,7 +268,7 @@ public final class Pipq<V> {
 
     public int leaderCounter(int tid) {
         validateTid(tid);
-        return leaderCounters[tid];
+        return leaderCounters.get(tid);
     }
 
     public int leaderSize() {
@@ -218,23 +285,35 @@ public final class Pipq<V> {
         return Optional.ofNullable(workerHeaps[tid].peekMin());
     }
 
+    /**
+     * Pops {@code tid}'s worker-min and upserts it into the leader list, if {@code tid}'s leader
+     * counter is below {@code threshold}. Assumes {@code workerHeaps[tid]}'s lock is already held
+     * by the caller — does not acquire it itself, since {@link CasLock} is not reentrant.
+     */
+    private boolean upsertFromWorkerUnlocked(int tid, int threshold) {
+        if (leaderCounters.get(tid) >= threshold) {
+            return false;
+        }
+
+        Node<V> promoted = workerHeaps[tid].deleteMinUnlocked();
+        if (promoted == null) {
+            return false;
+        }
+
+        insertIntoLeader(promoted);
+        leaderCounters.incrementAndGet(tid);
+        return true;
+    }
+
     private boolean promoteFromWorkerIfCounterBelow(int tid, int threshold) {
         WorkerHeap<V> heap = workerHeaps[tid];
         heap.lock();
         try {
-            if (leaderCounters[tid] >= threshold) {
-                return false;
+            if (upsertFromWorkerUnlocked(tid, threshold)) {
+                stats.recordWorkerHeapDeleteMinPromotion();
+                return true;
             }
-
-            Node<V> promoted = heap.deleteMinUnlocked();
-            if (promoted == null) {
-                return false;
-            }
-
-            insertIntoLeader(promoted);
-            leaderCounters[tid]++;
-            stats.recordWorkerHeapDeleteMinPromotion();
-            return true;
+            return false;
         } finally {
             heap.unlock();
         }
