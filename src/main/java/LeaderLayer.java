@@ -24,6 +24,18 @@ public interface LeaderLayer<V> {
 
     Node<V> deleteMaxByThread(int tid);
 
+    /**
+     * Fused {@code L-Insert} + {@code L-DeleteMaxP} (paper's {@code harris_insert_and_move}).
+     * Inserts {@code node} (tagged {@code tid}), then removes and returns {@code tid}'s worst
+     * (largest-key) node, or {@code null} (EMPTY) if {@code tid} has nothing evictable — e.g. a
+     * concurrent {@code deleteMin} drained {@code tid} mid-operation. Fusing the two steps (rather
+     * than calling {@link #insert} then {@link #deleteMaxByThread} separately) closes the window
+     * in which a concurrent {@code deleteMin} could observe {@code tid} transiently over {@code
+     * CNTR_MAX} or race the evict target — the same per-tid mutual-exclusion contract documented
+     * above applies.
+     */
+    Node<V> insertAndDeleteMaxByThread(Node<V> node, int tid);
+
     Node<V> maxByThread(int tid);
 
     int size();

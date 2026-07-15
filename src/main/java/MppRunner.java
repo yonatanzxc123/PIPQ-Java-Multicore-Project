@@ -18,7 +18,7 @@ public final class MppRunner {
         for (int tid = 0; tid < queue.threadCount(); tid++) {
             for (int i = 0; i < 100; i++) {
                 long key = (long) tid * 1000L + i;
-                queue.insert(tid, key, Integer.valueOf(i));
+                queue.insert(key, Integer.valueOf(i), tid);
             }
         }
 

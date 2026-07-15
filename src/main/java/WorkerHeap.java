@@ -81,7 +81,11 @@ public final class WorkerHeap<V> {
 
     void insertUnlocked(Node<V> node) {
         Objects.requireNonNull(node, "node");
-        node.next = null;
+        // Do NOT touch node.next here: WorkerHeap is array-based and never reads it, but the
+        // same Node object may still be reachable from a concurrent LeaderLinkedList traversal
+        // (e.g. a lagging search()/searchDelete() on another thread) if this node was just
+        // evicted from L and handed straight to a worker heap (Pipq's slowest-path/promotion
+        // paths). Nulling next here would corrupt that in-flight lock-free traversal.
         ensureCapacity(size + 1);
 
         int idx = size;
@@ -112,7 +116,7 @@ public final class WorkerHeap<V> {
             siftDown(last);
         }
 
-        min.next = null;
+        // See insertUnlocked: min.next is deliberately left untouched, for the same reason.
         return min;
     }
 

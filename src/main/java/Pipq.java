@@ -92,8 +92,15 @@ public final class Pipq<V> {
      * itself) — after a plain worker insert, if this thread's leader count is below {@code
      * CNTR_MIN}, its worker-min is popped and upserted into {@code L}. This keeps leader refill
      * from being solely delete-min's job.</p>
+     *
+     * <p>The slowest path calls {@link LeaderLayer#insertAndDeleteMaxByThread} — a single fused
+     * leader-level operation (paper's {@code harris_insert_and_move}) — rather than a separate
+     * {@code insert} followed by {@code deleteMaxByThread}. Fusing closes the window a concurrent
+     * coordinator {@code deleteMin} could otherwise use to drain {@code tid}'s nodes between the
+     * two calls; see {@link LeaderLinkedList#insertAndDeleteMaxByThread} for the mechanism and the
+     * EMPTY (nothing evictable) case handled below.</p>
      */
-    public void insert(int tid, long key, V value) {
+    public void insert(long key, V value, int tid) {
         validateTid(tid);
         stats.recordTotalInsert();
 
@@ -109,16 +116,34 @@ public final class Pipq<V> {
                     if (largest != null && key >= largest.key()) { // Alg 8 lines 10-12: fast.
                         insertIntoWorker(heap, node);
                         stats.recordFastPathInsert();
-                    } else { // Alg 8 lines 13-17: slowest.
-                        insertIntoLeader(node);
-                        Node<V> movedDown = leader.deleteMaxByThread(tid);
-                        if (movedDown == null) {
-                            throw new IllegalStateException("leader counter indicated a node for tid "
-                                    + tid + " but deleteMaxByThread found none");
+                    } else { // Alg 8 lines 13-17: slowest (fused, harris_insert_and_move).
+                        // Counter is deliberately untouched here, matching the paper: neither
+                        // harris_insert_and_move nor its caller (hier_insert_local) increments or
+                        // decrements t_lead_counters around this branch. The insert and the evict
+                        // are assumed to net to zero on tid's leader-list membership, which the
+                        // paper's own >=2-invariant is relied on to guarantee. This assumption
+                        // only holds reliably when CNTR_MIN/CNTR_MAX are far enough apart that a
+                        // concurrent deleteMin can't plausibly drain tid down to nothing between
+                        // this insert and its evict; see LeaderLinkedList#insertAndDeleteMaxByThread
+                        // and Pipq#executeAnnouncedDeleteMin's negative-counter guard for the
+                        // known, documented limitation at small CNTR_MIN/CNTR_MAX
+                        stats.recordLeaderInsert();
+                        Node<V> movedDown = leader.insertAndDeleteMaxByThread(node, tid);
+                        if (movedDown != null) {
+                            stats.recordLeaderDeleteMaxByThread();
+                            insertIntoWorker(heap, movedDown);
+                            stats.recordSlowestPathInsert();
+                        } else {
+                            // EMPTY: nothing evictable (a concurrent delete-min drained tid to
+                            // nothing since this thread's earlier CNTR_MAX read). Unlike the C++
+                            // implementation's `assert(dem_val != EMPTY)` (undefined behaviour if
+                            // it ever fires, since it would otherwise insert garbage into the
+                            // worker heap), we handle this gracefully by simply not moving
+                            // anything down. Counter untouched, same reasoning as the non-EMPTY
+                            // case above. Recorded as a degenerate slowest-path attempt (insert
+                            // happened, no eviction followed), not as a slower-path completion.
+                            stats.recordSlowestPathInsert();
                         }
-                        stats.recordLeaderDeleteMaxByThread();
-                        insertIntoWorker(heap, movedDown);
-                        stats.recordSlowestPathInsert();
                     }
                 } else { // Alg 8 lines 18-21: slower.
                     insertIntoLeader(node);
@@ -139,10 +164,6 @@ public final class Pipq<V> {
         } finally {
             heap.unlock(); // Alg 8 line 26.
         }
-    }
-
-    public void insert(long key, V value, int tid) {
-        insert(tid, key, value);
     }
 
     /**

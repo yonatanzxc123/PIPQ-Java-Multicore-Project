@@ -11,14 +11,14 @@ class PipqSequentialTest {
     @Test
     void deleteMinReturnsGlobalPriorityOrderAcrossThreads() {
         Pipq<String> pipq = new Pipq<>(2, 2, 3);
-        pipq.insert(0, 10, "a10");
-        pipq.insert(1, 20, "b20");
-        pipq.insert(0, 30, "a30");
-        pipq.insert(1, 40, "b40");
-        pipq.insert(0, 50, "a50");
-        pipq.insert(1, 60, "b60");
-        pipq.insert(0, 70, "a70");
-        pipq.insert(1, 80, "b80");
+        pipq.insert(10, "a10", 0);
+        pipq.insert(20, "b20", 1);
+        pipq.insert(30, "a30", 0);
+        pipq.insert(40, "b40", 1);
+        pipq.insert(50, "a50", 0);
+        pipq.insert(60, "b60", 1);
+        pipq.insert(70, "a70", 0);
+        pipq.insert(80, "b80", 1);
 
         List<Long> keys = new ArrayList<>();
         Optional<Node<String>> node;
@@ -32,10 +32,10 @@ class PipqSequentialTest {
     @Test
     void cntrMaxForcesSlowestPathAndMovesWorstLeaderNodeDown() {
         Pipq<String> pipq = new Pipq<>(1, 2, 2);
-        pipq.insert(0, 10, "ten");
-        pipq.insert(0, 20, "twenty");
+        pipq.insert(10, "ten", 0);
+        pipq.insert(20, "twenty", 0);
 
-        pipq.insert(0, 5, "five");
+        pipq.insert(5, "five", 0);
 
         assertEquals(2, pipq.leaderCounter(0));
         assertEquals(2, pipq.leaderSize());
@@ -48,9 +48,9 @@ class PipqSequentialTest {
     @Test
     void deleteMinPromotesFromWorkerWhenOwnerCounterDropsBelowTwo() {
         Pipq<String> pipq = new Pipq<>(1, 2, 2);
-        pipq.insert(0, 10, "ten");
-        pipq.insert(0, 20, "twenty");
-        pipq.insert(0, 5, "five");
+        pipq.insert(10, "ten", 0);
+        pipq.insert(20, "twenty", 0);
+        pipq.insert(5, "five", 0);
 
         Node<String> removed = pipq.deleteMin(0).orElseThrow(AssertionError::new);
 

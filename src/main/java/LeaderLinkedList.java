@@ -91,16 +91,32 @@ public class LeaderLinkedList<V> implements LeaderLayer<V> {
      *
      * <p>Relies on delete-min being globally serialized by the caller (paper: "only one thread
      * is ever performing a delete-min operation at the time"; our baseline enforces this via
-     * {@code Pipq.deleteMinLock}). Only {@code LOGDEL} is ever checked/set here — never
-     * {@code MOVING} — because the ≥2-elements-per-thread invariant (Lemma 2/4) guarantees the
-     * global min can never simultaneously be some thread's {@code deleteMaxByThread} target,
-     * matching the paper's own omission of moving-bit checks in this algorithm.</p>
+     * {@code Pipq.coordinatorLock} — only the thread holding it ever calls this method, whether
+     * serving its own request or combining others' via {@code Pipq.coordinate()}). Only
+     * {@code LOGDEL} is ever checked/set here — never {@code MOVING} — because the
+     * ≥2-elements-per-thread invariant (Lemma 2/4) guarantees the global min can never
+     * simultaneously be some thread's {@code deleteMaxByThread}/{@code
+     * insertAndDeleteMaxByThread} target, matching the paper's own omission of moving-bit checks
+     * in this algorithm.
+     *
+     * <p><b>Re-derivation under real lock-freedom</b> (the invariant stops being a moot,
+     * lock-protected detail once {@code L} is genuinely lock-free): the argument holds because a
+     * thread's min and max node in {@code L} are provably distinct nodes whenever it has ≥2 live
+     * nodes there — so this method's global-min target and some tid's evict target
+     * ({@link #deleteMaxByThread} / {@link #insertAndDeleteMaxByThread}) can coincide only if
+     * that tid has exactly one (or zero) nodes in {@code L}, which the coordinator's
+     * {@code < 2} promotion ({@code Pipq.executeAnnouncedDeleteMin}) is meant to prevent. The
+     * evict side additionally self-heals rather than relying on this holding perfectly at every
+     * instant: {@link #insertAndDeleteMaxByThread}'s fused insert+evict re-derives its target from
+     * *current* list state (not a stale snapshot) and returns {@code null} (EMPTY) gracefully if a
+     * concurrent {@code deleteMin} raced tid down to nothing evictable, instead of assuming a
+     * target still exists.</p>
      *
      * <p>{@code maxPerTid} is deliberately left untouched, exactly as in the paper: if the
      * removed node happened to be some tid's {@code maxPerTid[tid]}, that pointer only goes
      * stale in the narrow window before it self-heals via that tid's next {@code insert}
-     * ({@link #updateLargestByThread}) or next {@code deleteMaxByThread} call (which
-     * re-derives it in {@link #searchDelete}).</p>
+     * ({@link #updateLargestByThread}) or next {@code deleteMaxByThread}/{@code
+     * insertAndDeleteMaxByThread} call (which re-derives it in {@link #searchDelete}).</p>
      */
     @Override
     public Node<V> deleteMin() {
@@ -186,7 +202,48 @@ public class LeaderLinkedList<V> implements LeaderLayer<V> {
         if (startLeadLargest == null) {
             return null;
         }
+        return claimAndUnlinkMax(tid, startLeadLargest);
+    }
 
+    /**
+     * Fused {@code L-Insert} + {@code L-DeleteMaxP} — ported from {@code harris_insert_and_move}
+     * / {@code harris_search_ins_move} (paper's C++ implementation,
+     * {@code microbench/harris.cc:242-439}; not itself named in the Algorithm 4/8 pseudocode,
+     * which presents insert and evict as separate calls). Inserts {@code node}, then evicts
+     * {@code tid}'s worst node in the <em>same</em> operation, closing the window a caller doing
+     * two separate calls (insert, then {@link #deleteMaxByThread}) would otherwise leave open for
+     * a concurrent {@code deleteMin} to drain {@code tid} out from under the evict.
+     *
+     * <p>{@code startLeadLargest} is snapshotted <strong>before</strong> the insert (mirrors
+     * {@code harris_insert_and_move}'s {@code starting_last_ptr}), so the subsequent
+     * {@code searchDelete} walk has a stable target to walk toward regardless of what the insert
+     * itself just did to {@code maxPerTid[tid]}. If {@code tid} had no node before this call
+     * (nothing to evict) or a concurrent {@code deleteMin} removed every one of {@code tid}'s
+     * nodes before the evict phase runs, this returns {@code null} (EMPTY) instead of throwing —
+     * matching the paper's own EMPTY-handling in {@code harris_insert_and_move}, which returns
+     * EMPTY when {@code harris_search_ins_move} cannot find a target.</p>
+     */
+    @Override
+    public Node<V> insertAndDeleteMaxByThread(Node<V> node, int tid) {
+        Node<V> startLeadLargest = maxPerTid[tid]; // harris: starting_last_ptr, snapshot before insert.
+        insert(node);
+
+        if (startLeadLargest == null) {
+            return null; // tid had nothing to evict -> EMPTY.
+        }
+        return claimAndUnlinkMax(tid, startLeadLargest);
+    }
+
+    /**
+     * Shared claim-and-unlink loop for {@link #deleteMaxByThread} and
+     * {@link #insertAndDeleteMaxByThread}: repeatedly {@code searchDelete}s toward {@code
+     * startLeadLargest}, claims the found node via the MOVING bit, and unlinks it. Returns {@code
+     * null} (EMPTY) if a {@code searchDelete} walk finds no live {@code tid} window — e.g. a
+     * concurrent {@code deleteMin} removed every {@code tid} node since the caller's snapshot —
+     * instead of dereferencing a {@code null} window (the original source of the NPE this method
+     * replaces).
+     */
+    private Node<V> claimAndUnlinkMax(int tid, Node<V> startLeadLargest) {
         Node<V> lNode;
         Node<V> rNode;
         Node<V> rNodeNextRef;
@@ -194,6 +251,10 @@ public class LeaderLinkedList<V> implements LeaderLayer<V> {
             Window<V> w = searchDelete(tid, startLeadLargest);
             lNode = w.left();
             rNode = w.right();
+
+            if (lNode == null || rNode == null) {
+                return null; // tid drained mid-operation -> EMPTY.
+            }
 
             int[] rNextStamp = new int[1];
             rNodeNextRef = rNode.next.get(rNextStamp);
