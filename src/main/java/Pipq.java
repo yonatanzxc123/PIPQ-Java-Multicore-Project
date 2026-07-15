@@ -14,7 +14,7 @@ import java.util.concurrent.atomic.AtomicIntegerArray;
  *
  * <p>Satisfies {@link LeaderLayer}'s per-tid mutual-exclusion contract: every call into the
  * leader for a given {@code tid} — {@code insert}/{@code maxByThread}/{@code
- * deleteMaxByThread} in {@link #insert(int, long, Object)}, and the coordinator-side promotion
+ * deleteMaxByThread} in {@link #insert(long, Object, int)}, and the coordinator-side promotion
  * in {@link #promoteFromWorkerIfCounterBelow} — runs with {@code workerHeaps[tid]}'s lock
  * held, regardless of which thread is executing it.</p>
  */
