@@ -29,6 +29,7 @@ class PipqConcurrentSmokeTest {
             // concurrency and trips Pipq#executeAnnouncedDeleteMin's negative-counter guard --
             // a known, paper-inherited limitation, not a bug in this test's own logic.
             Pipq<String> pipq = new Pipq<>(threads, 10, 50);
+            pipq.setLogger(new ConcurrentLogger());
             ExecutorService executor = Executors.newFixedThreadPool(threads);
             CountDownLatch start = new CountDownLatch(1);
             List<Callable<Void>> tasks = new ArrayList<>();

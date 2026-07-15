@@ -13,6 +13,8 @@
         <maven.compiler.release>8</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <junit.version>5.11.4</junit.version>
+        <log4j.version>2.24.3</log4j.version>
+        <disruptor.version>3.4.4</disruptor.version>
     </properties>
 
     <dependencies>
@@ -21,6 +23,23 @@
             <artifactId>junit-jupiter</artifactId>
             <version>${junit.version}</version>
             <scope>test</scope>
+        </dependency>
+        <!-- Async logging (local dev/benchmark use only - never uploaded to course server) -->
+        <dependency>
+            <groupId>org.apache.logging.log4j</groupId>
+            <artifactId>log4j-api</artifactId>
+            <version>${log4j.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.logging.log4j</groupId>
+            <artifactId>log4j-core</artifactId>
+            <version>${log4j.version}</version>
+        </dependency>
+        <!-- LMAX Disruptor: ring buffer backing Log4j2 AsyncLogger. Must stay 3.x - 4.x needs Java 11. -->
+        <dependency>
+            <groupId>com.lmax</groupId>
+            <artifactId>disruptor</artifactId>
+            <version>${disruptor.version}</version>
         </dependency>
     </dependencies>
 

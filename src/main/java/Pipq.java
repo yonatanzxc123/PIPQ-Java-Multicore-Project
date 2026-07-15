@@ -31,6 +31,12 @@ public final class Pipq<V> {
     private final CasLock coordinatorLock = new CasLock();
     private final PipqStats stats = new PipqStats();
 
+    private PipqLogger logger = new NoopLogger();
+
+    public void setLogger(PipqLogger logger) {
+        this.logger = logger;
+    }
+
     /**
      * One per thread (paper's {@code AnnounceStruct}, Algorithm 2). A thread announces a pending
      * delete-min by setting {@link #status} true; the coordinator publishes {@link #result} and
@@ -107,6 +113,8 @@ public final class Pipq<V> {
         Node<V> node = new Node<>(key, value, tid);
         WorkerHeap<V> heap = workerHeaps[tid];
 
+        logger.log("INSERT: start", System.nanoTime(), tid, key, value);
+
         heap.lock(); // Alg 8 lines 2-6: acquire lock_val (CasLock spins the CAS internally).
         try {
             Node<V> heapMin = heap.peekMinUnlocked();
@@ -114,6 +122,7 @@ public final class Pipq<V> {
                 if (leaderCounters.get(tid) == cntrMax) { // Alg 8 line 9.
                     Node<V> largest = leader.maxByThread(tid); // t_lead_largest
                     if (largest != null && key >= largest.key()) { // Alg 8 lines 10-12: fast.
+                        // fast path, no log
                         insertIntoWorker(heap, node);
                         stats.recordFastPathInsert();
                     } else { // Alg 8 lines 13-17: slowest (fused, harris_insert_and_move).
@@ -145,7 +154,8 @@ public final class Pipq<V> {
                             stats.recordSlowestPathInsert();
                         }
                     }
-                } else { // Alg 8 lines 18-21: slower.
+                } else { // Alg 8 lines 18-21: slower//
+                    logger.log("INSERT: slower path taken", System.nanoTime(), tid);
                     insertIntoLeader(node);
                     leaderCounters.incrementAndGet(tid);
                     stats.recordSlowerPathInsert();
