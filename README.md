@@ -1,6 +1,6 @@
-# PIPQ Baseline
+# PIPQ Java Multicore Project
 
-This project implements a Java baseline of the original PIPQ design from "PIPQ: Strict Insert-Optimized Concurrent Priority Queue".
+This project implements the original PIPQ-style Java baseline from "PIPQ: Strict Insert-Optimized Concurrent Priority Queue" and an experimental heap-backed leader-layer variation.
 
 ## Run Tests
 
@@ -28,14 +28,16 @@ Upload only the `.class` files from `server-classes` to the shared OneDrive fold
 
 ## Class Map
 
-- `Node` stores the key, value, original inserting thread id, and sequence number used to break ties.
+- `Node` stores the key, value, and original inserting thread id.
 - `WorkerHeap` is the worker level: one custom array-backed binary min-heap per logical thread, protected by its own lock.
-- `SortedLinkedListLeader` is the original paper's leader level: a shared sorted linked list, not the later heap-based variation.
-- `Pipq` wires the worker and leader levels together with `CNTR_MIN`, `CNTR_MAX`, and per-thread leader counters.
+- `LeaderLinkedList` is the original paper-style leader level: a shared sorted linked list using Java CAS/stamped references.
+- `IndexedHeapLeader` is the proposed variation: a global indexed min-heap plus per-thread max-heaps.
+- `Pipq` wires the worker and leader levels together with `CNTR_MIN`, `CNTR_MAX`, and per-thread leader counters. Its default constructors use `LeaderLinkedList`; `Pipq.withIndexedHeapLeader(...)` creates the heap variation.
 - `PipqStats` exposes instrumentation for insert paths, leader operations, worker heap operations, and delete-min calls.
+- `MppRunner` benchmarks both `OG_PIPQ` and `HEAP_PIPQ`.
 
-## Baseline Scope
+## Scope
 
-This is intentionally a faithful algorithmic Java baseline, not a low-level C++ lock-free port. It uses Java locks instead of pointer-bit marking, bit stealing, and lock-free list CAS loops. The NUMA coordinator and combining mechanism from the paper is simplified to a single delete-min lock, while preserving the core invariant: for each thread id, all leader nodes owned by that id have keys no larger than that worker heap's minimum key.
+The default `Pipq` behavior remains the original sorted linked-list leader baseline. The heap leader is added as a separate variation for comparison. The full NUMA coordinator hierarchy from the paper is still simplified to one coordinator lock in this Java project.
 
-The heap-based leader-layer variation is not implemented in this baseline.
+The heap leader is not lock-free: it uses one internal lock and custom array-backed heaps to preserve the same abstract leader operations.
