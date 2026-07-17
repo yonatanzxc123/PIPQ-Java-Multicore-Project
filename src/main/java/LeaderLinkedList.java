@@ -52,6 +52,10 @@ public class LeaderLinkedList<V> implements LeaderLayer<V> {
         head.setNext(tail, 0);
     }
 
+    /**
+     * Ported from {@code L-Insert} (Alg. 3, paper p.11).
+     * Inserts new node into the correct place in list.
+     */
     @Override
     public void insert(Node<V> node) {
         Objects.requireNonNull(node, "node");
@@ -148,8 +152,8 @@ public class LeaderLinkedList<V> implements LeaderLayer<V> {
 
             if (offset > MAX_OFFSET) {
                 // Paper lines 14-15: batched physical deletion, Lindén-Jonsson style. Once too
-                // many logically-deleted nodes have piled up at the front, swing head straight
-                // past the whole dead prefix, discarding every skipped node at once.
+                // many logically-deleted nodes have piled up at the front, take head straight
+                // past the whole dead prefix.
                 //
                 // A plain store (not a CAS) is both what the paper does and safe to do here:
                 // every other mutator that could touch head.next — insert's CAS at the front of
@@ -169,7 +173,7 @@ public class LeaderLinkedList<V> implements LeaderLayer<V> {
 
     /**
      * Ported from {@code L-DeleteMaxP} (Alg. 4 lines 1-13, paper p.12). Removes and returns the
-     * node tagged {@code tid} with the largest key currently in the list — this is used by the
+     * node tagged {@code tid} with the largest key currently in the list - this is used by the
      * slowest insert path to make room for a new node before pushing it in. Returns {@code null}
      * if {@code tid} currently has no node in the list.
      *
@@ -193,17 +197,14 @@ public class LeaderLinkedList<V> implements LeaderLayer<V> {
     /**
      * A fused {@code L-Insert} + {@code L-DeleteMaxP}, ported from {@code harris_insert_and_move}
      * / {@code harris_search_ins_move} in the paper's C++ implementation ({@code
-     * microbench/harris.cc:242-439}). This combined operation isn't itself named in the Alg. 4/8
+     * microbench/harris.cc:242-439}). This combined operation isn't in the Alg. 4/8
      * pseudocode, which presents insert and evict as two separate calls. Here, {@code node} is
      * inserted and then {@code tid}'s worst node is evicted, both as one operation. Fusing them
      * closes a window that would otherwise be open if the caller instead made two separate calls
      * (insert, then {@link #deleteMaxByThread}): a concurrent {@code deleteMin} could drain {@code
      * tid}'s nodes in the gap between those two calls, leaving nothing for the evict to find.
-     *
-     * <p>{@code startLeadLargest} is captured <strong>before</strong> the insert runs (mirroring
-     * {@code harris_insert_and_move}'s {@code starting_last_ptr}), so the {@code searchDelete}
-     * walk that follows has a stable target regardless of what the insert itself just did to
-     * {@code maxPerTid[tid]}. This returns {@code null} instead of throwing in either of two
+     * <p>
+     * This returns {@code null} instead of throwing in either of two
      * cases: {@code tid} had no node in the list before this call (nothing to evict), or a
      * concurrent {@code deleteMin} removed all of {@code tid}'s nodes before the evict phase ran.
      * Both match the paper's own handling in {@code harris_insert_and_move}, which likewise
@@ -290,7 +291,7 @@ public class LeaderLinkedList<V> implements LeaderLayer<V> {
             Node<V> left = head;
             int[] leftNextStamp = new int[1];
             Node<V> leftNext = head.next().get(leftNextStamp);
-            leftNextStamp[0] &= ~LOGDEL_BIT;
+            leftNextStamp[0] &= ~LOGDEL_BIT; // Note: removes logdel bit off the copy of the stamp
 
             Node<V> x = head;
             int[] xNextStamp = new int[1];
@@ -310,9 +311,13 @@ public class LeaderLinkedList<V> implements LeaderLayer<V> {
                 prevLogdel = (xNextStamp[0] & LOGDEL_BIT) != 0;
                 xNext = x.next().get(xNextStamp);
             } while (Node.compare(x, target) < 0 || (xNextStamp[0] & MOVING_BIT) != 0 || prevLogdel);
+            // Keep walking while: x isn't big enough yet, OR
+            // x is itself mid-eviction (moving), OR
+            // x was logically deleted. In all three cases x is unfit to be r_node.
 
             Node<V> right = x;
 
+            // no nodes in between -> only check freshness
             if (leftNext == right) {
                 if (isRightMovingOrLeftLogdel(left, right)) {
                     continue searchAgain;
@@ -320,6 +325,7 @@ public class LeaderLinkedList<V> implements LeaderLayer<V> {
                 return new Window<>(left, right);
             }
 
+            // otherwise physically unlink in between nodes, and check freshness
             if (left.next().compareAndSet(leftNext, right, leftNextStamp[0], leftNextStamp[0])) {
                 if (isRightMovingOrLeftLogdel(left, right)) {
                     continue searchAgain;
@@ -341,7 +347,7 @@ public class LeaderLinkedList<V> implements LeaderLayer<V> {
     }
 
     /**
-     * Ported from {@code searchDelete} (Alg. 4 lines 14-47, paper p.12) — the by-thread variant
+     * Ported from {@code searchDelete} (Alg. 4 lines 14-47, paper p.12) - the by-thread variant
      * of {@link #search}. It walks from {@code head}, tracking the running non-moving
      * predecessor candidate exactly as {@code search()} does with {@code left}/{@code leftNext}
      * (here named {@code curLNode}/{@code curLNodeNext}/{@code curLNodeNextStamp}). On top of
@@ -417,7 +423,7 @@ public class LeaderLinkedList<V> implements LeaderLayer<V> {
      * Ported from {@code searchPhysDel} (Alg. 4 lines 48-73, paper p.12). Locates a stable
      * (non-moving, not logically deleted) predecessor for {@code searchNode} and physically
      * unlinks it. This is the fallback path used by {@link #claimAndUnlinkMax} — the shared
-     * helper behind both {@link #deleteMaxByThread} and {@link #insertAndDeleteMaxByThread} —
+     * helper behind both {@link #deleteMaxByThread} and {@link #insertAndDeleteMaxByThread} -
      * when its direct unlink CAS (on {@code lNode}/{@code rNode}) loses a race. If {@code
      * searchNode} can no longer be found in the list, another thread has already physically
      * unlinked it, so this method does nothing — matching the paper's "search_node has been
