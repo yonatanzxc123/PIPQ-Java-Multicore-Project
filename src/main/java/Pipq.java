@@ -4,13 +4,14 @@ import java.util.concurrent.atomic.AtomicIntegerArray;
 /**
  * Faithful Java baseline of the original PIPQ algorithmic structure.
  *
- * <p>PIPQ has a worker level, with one local min-heap per logical thread (each with its own
- * lock, see {@link WorkerHeap}), and a leader level ({@link LeaderLinkedList}) that holds the
- * highest-priority candidate elements in a lock-free sorted linked list. This class simplifies
- * away the paper's NUMA leader/coordinator combining mechanism: instead of that multi-level
- * election, delete-min here is serialized with a single lock.</p>
+ * <p>PIPQ has a worker level with one local min-heap per logical thread (own lock, see
+ * {@link WorkerHeap}) and a leader level ({@link LeaderLinkedList}) containing the
+ * highest-priority candidate elements in a lock-free sorted linked list. This class
+ * simplifies away the paper's NUMA leader/coordinator combining mechanism by serializing
+ * delete-min with a single lock.</p>
  *
- * <p>The proposed heap-based leader-layer variation is not implemented here.</p>
+ * <p>This class simplifies away the paper's NUMA leader/coordinator combining mechanism by
+ * serializing delete-min with a single lock.</p>
  *
  * <p>This class satisfies {@link LeaderLayer}'s per-tid mutual-exclusion contract: every call
  * into the leader for a given {@code tid} runs while {@code workerHeaps[tid]}'s lock is held, no
@@ -26,7 +27,7 @@ public final class Pipq<V> {
     private static final int REQUIRED_LEADER_MINIMUM = 2;
 
     private final WorkerHeap<V>[] workerHeaps;
-    private final LeaderLinkedList<V> leader;
+    private final LeaderLayer<V> leader;
     private final AtomicIntegerArray leaderCounters;
     private final AnnounceSlot<V>[] announce;
     private final int cntrMin;
@@ -66,6 +67,23 @@ public final class Pipq<V> {
 
     @SuppressWarnings("unchecked")
     public Pipq(int initialWorkerHeapCapacity, int numberOfThreads, int cntrMin, int cntrMax) {
+        this(initialWorkerHeapCapacity, numberOfThreads, cntrMin, cntrMax,
+                createDefaultLeader(numberOfThreads));
+    }
+
+    public static <V> Pipq<V> withIndexedHeapLeader(int numberOfThreads, int cntrMin, int cntrMax) {
+        return withIndexedHeapLeader(DEFAULT_WORKER_HEAP_CAPACITY, numberOfThreads, cntrMin, cntrMax);
+    }
+
+    public static <V> Pipq<V> withIndexedHeapLeader(int initialWorkerHeapCapacity, int numberOfThreads,
+                                                     int cntrMin, int cntrMax) {
+        return new Pipq<V>(initialWorkerHeapCapacity, numberOfThreads, cntrMin, cntrMax,
+                new IndexedHeapLeader<V>(numberOfThreads));
+    }
+
+    @SuppressWarnings("unchecked")
+    public Pipq(int initialWorkerHeapCapacity, int numberOfThreads, int cntrMin, int cntrMax,
+                LeaderLayer<V> leader) {
         if (numberOfThreads <= 0) {
             throw new IllegalArgumentException("numberOfThreads must be positive");
         }
@@ -78,12 +96,15 @@ public final class Pipq<V> {
         if (cntrMax < cntrMin) {
             throw new IllegalArgumentException("CNTR_MAX must be greater than or equal to CNTR_MIN");
         }
+        if (leader == null) {
+            throw new NullPointerException("leader");
+        }
 
         this.workerHeaps = (WorkerHeap<V>[]) new WorkerHeap<?>[numberOfThreads];
         for (int i = 0; i < numberOfThreads; i++) {
             workerHeaps[i] = new WorkerHeap<>(initialWorkerHeapCapacity);
         }
-        this.leader = new LeaderLinkedList<>(numberOfThreads);
+        this.leader = leader;
         this.leaderCounters = new AtomicIntegerArray(numberOfThreads);
         this.announce = (AnnounceSlot<V>[]) new AnnounceSlot<?>[numberOfThreads];
         for (int i = 0; i < numberOfThreads; i++) {
@@ -91,6 +112,13 @@ public final class Pipq<V> {
         }
         this.cntrMin = cntrMin;
         this.cntrMax = cntrMax;
+    }
+
+    private static <V> LeaderLayer<V> createDefaultLeader(int numberOfThreads) {
+        if (numberOfThreads <= 0) {
+            throw new IllegalArgumentException("numberOfThreads must be positive");
+        }
+        return new LeaderLinkedList<V>(numberOfThreads);
     }
 
     /**

@@ -15,8 +15,6 @@ import java.util.concurrent.Future;
  * Java 8 class files, with no Maven/JUnit/runtime extras available.</p>
  */
 public final class MppRunner {
-    private static final String IMPLEMENTATION = "OG_PIPQ";
-
     private static final int[] THREAD_COUNTS = {1, 2, 4, 8, 16, 32};
     private static final long WARMUP_MILLIS = 1_000L;
     private static final long MEASURED_MILLIS = 5_000L;
@@ -37,23 +35,28 @@ public final class MppRunner {
         List<String> output = new ArrayList<String>();
 
         try {
-            if (!runSanityCheck(output)) {
-                printAll(output);
-                System.out.println("DONE");
-                return;
+            for (int i = 0; i < Implementation.values().length; i++) {
+                if (!runSanityCheck(Implementation.values()[i], output)) {
+                    printAll(output);
+                    System.out.println("DONE");
+                    return;
+                }
             }
 
             output.add(headerLine());
-            for (int w = 0; w < Workload.values().length; w++) {
-                Workload workload = Workload.values()[w];
-                for (int t = 0; t < THREAD_COUNTS.length; t++) {
-                    int threadCount = THREAD_COUNTS[t];
-                    try {
-                        runPhase(workload, threadCount, WARMUP_MILLIS, false);
-                        BenchmarkResult result = runPhase(workload, threadCount, MEASURED_MILLIS, true);
-                        output.add(result.toCsvLine());
-                    } catch (Throwable error) {
-                        output.add(errorLine(workload, threadCount, error));
+            for (int i = 0; i < Implementation.values().length; i++) {
+                Implementation implementation = Implementation.values()[i];
+                for (int w = 0; w < Workload.values().length; w++) {
+                    Workload workload = Workload.values()[w];
+                    for (int t = 0; t < THREAD_COUNTS.length; t++) {
+                        int threadCount = THREAD_COUNTS[t];
+                        try {
+                            runPhase(implementation, workload, threadCount, WARMUP_MILLIS, false);
+                            BenchmarkResult result = runPhase(implementation, workload, threadCount, MEASURED_MILLIS, true);
+                            output.add(result.toCsvLine());
+                        } catch (Throwable error) {
+                            output.add(errorLine(implementation, workload, threadCount, error));
+                        }
                     }
                 }
             }
@@ -66,8 +69,8 @@ public final class MppRunner {
         System.out.println("DONE");
     }
 
-    private static boolean runSanityCheck(List<String> output) {
-        Pipq<Integer> queue = new Pipq<Integer>(3, CNTR_MIN, CNTR_MAX);
+    private static boolean runSanityCheck(Implementation implementation, List<String> output) {
+        Pipq<Integer> queue = implementation.createQueue(3);
         long[] keys = {9L, 1L, 7L, 2L, 5L, 3L};
         for (int i = 0; i < keys.length; i++) {
             queue.insert(keys[i], Integer.valueOf(i), i % queue.threadCount());
@@ -79,8 +82,8 @@ public final class MppRunner {
         while ((current = queue.deleteMin(0)).isPresent()) {
             long key = current.get().key();
             if (key < previous) {
-                output.add("ERROR,SANITY,deleteMin returned decreasing keys,previous="
-                        + previous + ",current=" + key);
+                output.add("ERROR,SANITY," + implementation.name()
+                        + ",deleteMin returned decreasing keys,previous=" + previous + ",current=" + key);
                 return false;
             }
             previous = key;
@@ -88,24 +91,26 @@ public final class MppRunner {
         }
 
         if (removed != keys.length) {
-            output.add("ERROR,SANITY,expectedRemoved=" + keys.length + ",actualRemoved=" + removed);
+            output.add("ERROR,SANITY," + implementation.name()
+                    + ",expectedRemoved=" + keys.length + ",actualRemoved=" + removed);
             return false;
         }
 
         for (int tid = 0; tid < queue.threadCount(); tid++) {
             if (queue.leaderCounter(tid) < 0) {
-                output.add("ERROR,SANITY,negativeLeaderCounter,tid=" + tid);
+                output.add("ERROR,SANITY," + implementation.name() + ",negativeLeaderCounter,tid=" + tid);
                 return false;
             }
         }
 
-        output.add("SANITY,OK,removed=" + removed + ",validationMethods=not_exposed");
+        output.add("SANITY,OK," + implementation.name() + ",removed=" + removed
+                + ",validationMethods=not_exposed");
         return true;
     }
 
-    private static BenchmarkResult runPhase(Workload workload, int threadCount, long millis, boolean measured)
-            throws Exception {
-        final Pipq<Integer> queue = new Pipq<Integer>(threadCount, CNTR_MIN, CNTR_MAX);
+    private static BenchmarkResult runPhase(Implementation implementation, Workload workload, int threadCount,
+                                            long millis, boolean measured) throws Exception {
+        final Pipq<Integer> queue = implementation.createQueue(threadCount);
         prefill(queue, workload, threadCount);
         StatsSnapshot statsBefore = measured ? StatsSnapshot.capture(queue.stats()) : null;
 
@@ -135,7 +140,7 @@ public final class MppRunner {
             return null;
         }
 
-        return new BenchmarkResult(workload, threadCount, totals, elapsedNanos, queue, statsBefore);
+        return new BenchmarkResult(implementation, workload, threadCount, totals, elapsedNanos, queue, statsBefore);
     }
 
     private static void prefill(Pipq<Integer> queue, Workload workload, int threadCount) {
@@ -160,12 +165,12 @@ public final class MppRunner {
                 + "minLeaderCounter,postCheck";
     }
 
-    private static String errorLine(Workload workload, int threadCount, Throwable error) {
+    private static String errorLine(Implementation implementation, Workload workload, int threadCount, Throwable error) {
         Throwable cause = error;
         while (cause.getCause() != null) {
             cause = cause.getCause();
         }
-        return "ERROR," + IMPLEMENTATION + "," + workload.name() + "," + threadCount + ","
+        return "ERROR," + implementation.name() + "," + workload.name() + "," + threadCount + ","
                 + sanitize(cause.getClass().getSimpleName()) + "," + sanitize(cause.getMessage());
     }
 
@@ -202,6 +207,18 @@ public final class MppRunner {
 
         int prefillPerThread() {
             return prefillPerThread;
+        }
+    }
+
+    private enum Implementation {
+        OG_PIPQ,
+        HEAP_PIPQ;
+
+        Pipq<Integer> createQueue(int threadCount) {
+            if (this == HEAP_PIPQ) {
+                return Pipq.withIndexedHeapLeader(threadCount, CNTR_MIN, CNTR_MAX);
+            }
+            return new Pipq<Integer>(threadCount, CNTR_MIN, CNTR_MAX);
         }
     }
 
@@ -272,6 +289,7 @@ public final class MppRunner {
     }
 
     private static final class BenchmarkResult {
+        private final Implementation implementation;
         private final Workload workload;
         private final int threadCount;
         private final ThreadCounts counts;
@@ -279,8 +297,9 @@ public final class MppRunner {
         private final Pipq<Integer> queue;
         private final StatsSnapshot statsBefore;
 
-        BenchmarkResult(Workload workload, int threadCount, ThreadCounts counts,
+        BenchmarkResult(Implementation implementation, Workload workload, int threadCount, ThreadCounts counts,
                         long elapsedNanos, Pipq<Integer> queue, StatsSnapshot statsBefore) {
+            this.implementation = implementation;
             this.workload = workload;
             this.threadCount = threadCount;
             this.counts = counts;
@@ -296,7 +315,7 @@ public final class MppRunner {
             int minLeaderCounter = minLeaderCounter(queue);
             boolean postCheck = minLeaderCounter >= 0 && queue.leaderSize() >= 0;
 
-            return "RESULT," + IMPLEMENTATION
+            return "RESULT," + implementation.name()
                     + "," + workload.name()
                     + "," + threadCount
                     + "," + counts.totalOps()
