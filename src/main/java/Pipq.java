@@ -81,6 +81,25 @@ public final class Pipq<V> {
                 new IndexedHeapLeader<V>(numberOfThreads));
     }
 
+    /**
+     * Heap-based leader layer synchronized with Flat Combining instead of a coarse lock — see
+     * {@link CombiningHeapLeader}. Wired the same way as {@link #withIndexedHeapLeader}: the
+     * only callers into the leader are this {@code Pipq}'s {@code numberOfThreads} worker
+     * threads (via {@code insert}, {@code helpUpsert}, and whichever one wins {@link
+     * #coordinatorLock} to call {@code leader.deleteMin()}), so {@code numberOfThreads} is also
+     * exactly the number of distinct callers {@link CombiningHeapLeader} needs to provision
+     * publication slots for.
+     */
+    public static <V> Pipq<V> withCombiningHeapLeader(int numberOfThreads, int cntrMin, int cntrMax) {
+        return withCombiningHeapLeader(DEFAULT_WORKER_HEAP_CAPACITY, numberOfThreads, cntrMin, cntrMax);
+    }
+
+    public static <V> Pipq<V> withCombiningHeapLeader(int initialWorkerHeapCapacity, int numberOfThreads,
+                                                       int cntrMin, int cntrMax) {
+        return new Pipq<V>(initialWorkerHeapCapacity, numberOfThreads, cntrMin, cntrMax,
+                new CombiningHeapLeader<V>(numberOfThreads));
+    }
+
     @SuppressWarnings("unchecked")
     public Pipq(int initialWorkerHeapCapacity, int numberOfThreads, int cntrMin, int cntrMax,
                 LeaderLayer<V> leader) {
