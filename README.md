@@ -23,8 +23,6 @@ mvn -q compile
 
 This produces flat `.class` files in `target/classes`. Upload **all** of them **except `ConcurrentLogger.class`** (and skip `log4j2.xml`). Do not add the `.setLogger(...)` line described below anywhere in code you upload — without it, `Pipq` never touches log4j and needs nothing beyond the JDK.
 
-Do not upload source files, Maven files, folders, text files, or temporary files. The server runs `MppRunner.main`, so [MppRunner.java](src/main/java/MppRunner.java) is the required entry point.
-
 If compiling manually instead of using Maven, exclude `ConcurrentLogger.java` — it imports log4j2 classes that plain `javac` won't have on its classpath:
 
 ```bash
