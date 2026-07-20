@@ -216,7 +216,7 @@ public final class MppRunner {
 
         Pipq<Integer> createQueue(int threadCount) {
             if (this == HEAP_PIPQ) {
-                return Pipq.withIndexedHeapLeader(threadCount, CNTR_MIN, CNTR_MAX);
+                return Pipq.withCombiningHeapLeader(threadCount, CNTR_MIN, CNTR_MAX);
             }
             return new Pipq<Integer>(threadCount, CNTR_MIN, CNTR_MAX);
         }

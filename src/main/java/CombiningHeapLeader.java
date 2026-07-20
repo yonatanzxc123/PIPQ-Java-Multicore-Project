@@ -1,6 +1,5 @@
 import java.util.IdentityHashMap;
 import java.util.Map;
-import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Heap-based implementation of PIPQ's leader layer, synchronized with Flat Combining (Hendler,
@@ -38,11 +37,17 @@ public final class CombiningHeapLeader<V> implements LeaderLayer<V> {
     }
 
     /**
-     * One publication slot per caller. A caller fills in {@link #op}/{@link #argNode}/{@link
-     * #argTid}, then sets {@link #pending} true (a volatile write, published last) to announce
-     * the request. The combiner reads a pending slot, applies the operation,
-     * writes {@link #resultNode}/{@link #resultBool}/{@link #resultException} first, then
-     * sets {@link #pending} false last (volatile write) to publish the result back.
+     * One publication slot per {@code tid} (slots {@code [0, threadCount)}), plus two fixed
+     * slots reserved for {@code deleteMin} and {@code validateInternal} (neither carries a
+     * {@code tid}, and both are already guaranteed at most one caller at a time -- see the
+     * field javadocs on {@link #deleteMinSlot}/{@link #validateSlot}). Slots are never assigned
+     * by physical calling thread, so any number of distinct OS threads may use the leader over
+     * time as long as at most one is active per tid at once (already required by {@link
+     * LeaderLayer}'s contract). A caller fills in {@link #op}/{@link #argNode}/{@link #argTid},
+     * then sets {@link #pending} true (a volatile write, published last) to announce the
+     * request. The combiner reads a pending slot, applies the operation, writes {@link
+     * #resultNode}/{@link #resultBool}/{@link #resultException} first, then sets {@link
+     * #pending} false last (volatile write) to publish the result back.
      */
     private static final class Publication<V> {
         volatile boolean pending;
@@ -54,12 +59,18 @@ public final class CombiningHeapLeader<V> implements LeaderLayer<V> {
         RuntimeException resultException;
     }
 
+    // Slots [0, threadCount) are keyed by tid -- safe because insert/deleteMaxByThread/
+    // insertAndDeleteMaxByThread are externally serialized per tid (LeaderLayer's contract),
+    // regardless of which physical thread makes the call. deleteMin() and validateInternal()
+    // carry no tid, but Pipq already guarantees a single system-wide caller for deleteMin at
+    // any instant, and validateInternal() is test-only and always called out of band from other
+    // ops, so each gets one dedicated reserved slot instead of being assigned per calling thread.
     private final Publication<V>[] announceSlots;
     private final CasLock combineLock = new CasLock();
     private final CasLock[] maxHeapLocks;
-    private final ThreadLocal<Integer> slotIndex;
-    private final AtomicInteger nextSlotIndex = new AtomicInteger(0);
     private final int threadCount;
+    private final int deleteMinSlot;
+    private final int validateSlot;
 
     @SuppressWarnings("unchecked")
     public CombiningHeapLeader(int threadCount) {
@@ -67,25 +78,21 @@ public final class CombiningHeapLeader<V> implements LeaderLayer<V> {
             throw new IllegalArgumentException("threadCount must be positive");
         }
         this.threadCount = threadCount;
+        this.deleteMinSlot = threadCount;
+        this.validateSlot = threadCount + 1;
         this.globalMinHeap = (Entry<V>[]) new Entry<?>[DEFAULT_CAPACITY];
         this.perThreadMax = (ThreadMaxHeap<V>[]) new ThreadMaxHeap<?>[threadCount];
         for (int i = 0; i < threadCount; i++) {
             perThreadMax[i] = new ThreadMaxHeap<>();
         }
-        this.announceSlots = (Publication<V>[]) new Publication<?>[threadCount];
+        this.announceSlots = (Publication<V>[]) new Publication<?>[threadCount + 2];
         this.maxHeapLocks = new CasLock[threadCount];
-        for (int i = 0; i < threadCount; i++) {
+        for (int i = 0; i < announceSlots.length; i++) {
             announceSlots[i] = new Publication<>();
+        }
+        for (int i = 0; i < threadCount; i++) {
             maxHeapLocks[i] = new CasLock();
         }
-        this.slotIndex = ThreadLocal.withInitial(() -> {
-            int idx = nextSlotIndex.getAndIncrement();
-            if (idx >= CombiningHeapLeader.this.threadCount) {
-                throw new IllegalStateException(
-                        "more calling threads than threadCount=" + CombiningHeapLeader.this.threadCount);
-            }
-            return idx;
-        });
     }
 
     @Override
@@ -93,7 +100,8 @@ public final class CombiningHeapLeader<V> implements LeaderLayer<V> {
         if (node == null) {
             throw new NullPointerException("node");
         }
-        Publication<V> slot = mySlot();
+        validateTid(node.tid());
+        Publication<V> slot = announceSlots[node.tid()];
         slot.op = Op.INSERT;
         slot.argNode = node;
         slot.argTid = node.tid();
@@ -102,7 +110,7 @@ public final class CombiningHeapLeader<V> implements LeaderLayer<V> {
 
     @Override
     public Node<V> deleteMin() {
-        Publication<V> slot = mySlot();
+        Publication<V> slot = announceSlots[deleteMinSlot];
         slot.op = Op.DELETE_MIN;
         submit(slot);
         return slot.resultNode;
@@ -111,7 +119,7 @@ public final class CombiningHeapLeader<V> implements LeaderLayer<V> {
     @Override
     public Node<V> deleteMaxByThread(int tid) {
         validateTid(tid);
-        Publication<V> slot = mySlot();
+        Publication<V> slot = announceSlots[tid];
         slot.op = Op.DELETE_MAX_BY_THREAD;
         slot.argTid = tid;
         submit(slot);
@@ -127,7 +135,7 @@ public final class CombiningHeapLeader<V> implements LeaderLayer<V> {
         if (node.tid() != tid) {
             throw new IllegalArgumentException("node tid does not match requested tid");
         }
-        Publication<V> slot = mySlot();
+        Publication<V> slot = announceSlots[tid];
         slot.op = Op.INSERT_AND_DELETE_MAX_BY_THREAD;
         slot.argNode = node;
         slot.argTid = tid;
@@ -164,14 +172,10 @@ public final class CombiningHeapLeader<V> implements LeaderLayer<V> {
     }
 
     boolean validateInternal() {
-        Publication<V> slot = mySlot();
+        Publication<V> slot = announceSlots[validateSlot];
         slot.op = Op.VALIDATE;
         submit(slot);
         return slot.resultBool;
-    }
-
-    private Publication<V> mySlot() {
-        return announceSlots[slotIndex.get()];
     }
 
     /**

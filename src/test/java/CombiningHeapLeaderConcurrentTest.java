@@ -30,14 +30,12 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * plus no lost/duplicated nodes and globally sorted {@code deleteMin} output -- the same
  * properties the list-leader concurrent tests check.
  *
- * <p>{@code CombiningHeapLeader} assigns one publication slot per <em>calling thread</em> (not
- * per tid -- {@code deleteMin()} carries no tid), lazily on a thread's first call, and never
- * recycles a slot. Every test below is careful to only ever touch the leader from the pool
- * threads it was sized for: {@link org.junit.jupiter.api.Assertions#assertTimeoutPreemptively}
- * runs its lambda body on its own extra thread, so any leader call made directly in the lambda
- * (rather than inside a task submitted to the fixed pool) would be an undercounted extra caller
- * and trip the "more calling threads than threadCount" guard. {@code size()} is exempt --
- * it reads a plain published counter, not a publication slot -- so it's called directly.</p>
+ * <p>{@code CombiningHeapLeader} assigns one publication slot per {@code tid}, plus two fixed
+ * slots reserved for {@code deleteMin}/{@code validateInternal} (see the class javadoc there) --
+ * slots are no longer tied to physical calling threads, so tests are free to reuse pool threads
+ * for follow-up calls like {@code validateInternal()} or a final drain without any thread-count
+ * bookkeeping. {@code size()} is exempt entirely -- it reads a plain published counter, not a
+ * publication slot -- so it's called directly.</p>
  */
 class CombiningHeapLeaderConcurrentTest {
     /**
