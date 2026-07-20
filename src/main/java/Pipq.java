@@ -48,13 +48,6 @@ public final class Pipq<V> {
      * {@code status} follows the paper's convention: {@code true} means "still pending", {@code
      * false} means "already served". Each thread reuses its own slot across calls, which is safe
      * because a single thread never has two delete-mins in flight at once.
-     *
-     * <p>Why this is safe without extra synchronization: the coordinator writes {@code result}
-     * as a plain field before it writes {@code status = false} (a volatile write). The waiting
-     * thread reads {@code status} (volatile) before it reads {@code result}. Because the
-     * coordinator always writes {@code result} first — in both branches of
-     * {@link Pipq#executeAnnouncedDeleteMin} — the waiting thread can never see a stale or
-     * missing result once it sees {@code status} flip to false.</p>
      */
     private static final class AnnounceSlot<V> {
         volatile boolean status;
@@ -81,15 +74,6 @@ public final class Pipq<V> {
                 new IndexedHeapLeader<V>(numberOfThreads));
     }
 
-    /**
-     * Heap-based leader layer synchronized with Flat Combining instead of a coarse lock — see
-     * {@link CombiningHeapLeader}. Wired the same way as {@link #withIndexedHeapLeader}: the
-     * only callers into the leader are this {@code Pipq}'s {@code numberOfThreads} worker
-     * threads (via {@code insert}, {@code helpUpsert}, and whichever one wins {@link
-     * #coordinatorLock} to call {@code leader.deleteMin()}), so {@code numberOfThreads} is also
-     * exactly the number of distinct callers {@link CombiningHeapLeader} needs to provision
-     * publication slots for.
-     */
     public static <V> Pipq<V> withCombiningHeapLeader(int numberOfThreads, int cntrMin, int cntrMax) {
         return withCombiningHeapLeader(DEFAULT_WORKER_HEAP_CAPACITY, numberOfThreads, cntrMin, cntrMax);
     }
@@ -146,12 +130,6 @@ public final class Pipq<V> {
      * check (line 9) and the fast/slowest split (line 10); the plain fast path (line 22) is the
      * trailing {@code else}.
      *
-     * <p>The trailing fast path also does one thing the pseudocode does not: a proactive top-up
-     * toward {@code CNTR_MIN}, carried over from the C++ implementation's {@code
-     * hier_insert_local}. After a plain worker insert, if this thread's leader count is below
-     * {@code CNTR_MIN}, its worker-min is popped and pushed up into {@code L}. This spreads the
-     * work of keeping the leader list topped up, instead of leaving it entirely to delete-min.</p>
-     *
      * <p>The slowest path calls {@link LeaderLayer#insertAndDeleteMaxByThread}, which performs
      * insert and evict as one fused leader-level operation (the paper's {@code
      * harris_insert_and_move}) rather than as two separate calls ({@code insert} then {@code
@@ -180,6 +158,7 @@ public final class Pipq<V> {
                         // Fast path: the new key doesn't earn a spot in the leader list, so it
                         // just goes into this thread's own worker heap.
                         insertIntoWorker(heap, node);
+                        logger.log("INSERT: fast path taken", System.nanoTime(), tid);
                         stats.recordFastPathInsert();
                     } else { // Alg. 8 lines 13-17: slowest path (fused insert + evict, harris_insert_and_move).
                         // The leader counter for this thread is deliberately left unchanged here,
@@ -210,33 +189,36 @@ public final class Pipq<V> {
                             // ever fired, since it would otherwise push garbage into the worker
                             // heap. We instead handle it gracefully: simply don't move anything
                             // down. The leader counter stays untouched, for the same reason as
-                            // above. We still record this as a (degenerate) slowest-path insert —
-                            // the insert happened, just without a matching eviction — not as a
+                            // above. We still record this as a slowest-path insert -
+                            // the insert happened, just without a matching eviction - not as a
                             // slower-path completion.
                             stats.recordSlowestPathInsert();
                         }
                     }
                 } else { // Alg. 8 lines 18-21: slower path — leader list has room, so just insert into it.
-                    logger.log("INSERT: slower path taken", System.nanoTime(), tid);
                     insertIntoLeader(node);
                     leaderCounters.incrementAndGet(tid);
+                    logger.log("INSERT: slower path taken", System.nanoTime(), tid);
                     stats.recordSlowerPathInsert();
                 }
             } else { // Alg. 8 lines 22-24: fast path — key is no better than our own worker-min.
                 insertIntoWorker(heap, node);
+                logger.log("INSERT: fast path taken", System.nanoTime(), tid);
                 stats.recordFastPathInsert();
 
                 // Proactive top-up toward CNTR_MIN, carried over from the C++ implementation's
                 // hier_insert_local (not part of Alg. 8's pseudocode). Keeps the leader list from
-                // running dry between delete-mins. The unlocked variant is used because CasLock
-                // isn't reentrant and the worker heap's lock is already held above.
+                // running dry between delete-mins. The unlocked variant is used because
+                // the worker heap's lock is already held above.
                 if (upsertFromWorkerUnlocked(tid, cntrMin)) {
                     stats.recordFastPathUpsert();
                 }
             }
         } finally {
-            heap.unlock(); // Alg. 8 line 26.
+            heap.unlock();
         }
+
+        logger.log("INSERT: end", System.nanoTime(), tid);
     }
 
     /**
@@ -253,12 +235,18 @@ public final class Pipq<V> {
         validateTid(tid);
         stats.recordTotalDeleteMin();
 
+        logger.log("DELETE MIN: start", System.nanoTime(), tid);
+
         AnnounceSlot<V> slot = announce[tid];
+
+        logger.log("DELETE MIN: announced", System.nanoTime(), tid);
+
         slot.status = true; // Alg. 9 line 3: announce the operation.
 
         while (slot.status) {
             if (coordinatorLock.tryLock()) {
                 try {
+                    logger.log("DELETE MIN: about to coordinate", System.nanoTime(), tid);
                     coordinate(); // Drains all pending slots, including this thread's own.
                 } finally {
                     coordinatorLock.unlock();
@@ -266,6 +254,7 @@ public final class Pipq<V> {
                 break;
             }
 
+            logger.log("DELETE MIN: lost coordinator race", System.nanoTime(), tid);
             // Lost the race to become coordinator. Rather than block, help keep the leader list
             // topped up (Alg. 9 lines 19/34), then loop back and check whether a coordinator has
             // served this thread's request yet.
@@ -315,8 +304,10 @@ public final class Pipq<V> {
         }
 
         slot.result = removed;
+        logger.log("COORD.DELETE MIN: removed min", System.nanoTime(), ownerTid, removed.key(), removed.value());
 
         if (after < REQUIRED_LEADER_MINIMUM) {
+            logger.log("COORD.DELETE MIN: counter below min", System.nanoTime(), ownerTid);
             promoteFromWorkerIfCounterBelow(ownerTid, REQUIRED_LEADER_MINIMUM);
         }
     }
@@ -342,9 +333,11 @@ public final class Pipq<V> {
         }
         try {
             if (upsertFromWorkerUnlocked(tid, cntrMin)) {
+                logger.log("UPSERT: completed", System.nanoTime(), tid);
                 stats.recordHelpUpsert();
                 return true;
             }
+            logger.log("UPSERT: failed", System.nanoTime(), tid);
             return false;
         } finally {
             heap.unlock();
@@ -404,6 +397,7 @@ public final class Pipq<V> {
 
         insertIntoLeader(promoted);
         leaderCounters.incrementAndGet(tid);
+        logger.log("UPSERT: promoting", System.nanoTime(), tid, promoted.key(), promoted.value());
         return true;
     }
 
