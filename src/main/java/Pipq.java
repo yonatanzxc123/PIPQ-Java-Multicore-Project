@@ -74,16 +74,6 @@ public final class Pipq<V> {
                 new IndexedHeapLeader<V>(numberOfThreads));
     }
 
-    public static <V> Pipq<V> withCombiningHeapLeader(int numberOfThreads, int cntrMin, int cntrMax) {
-        return withCombiningHeapLeader(DEFAULT_WORKER_HEAP_CAPACITY, numberOfThreads, cntrMin, cntrMax);
-    }
-
-    public static <V> Pipq<V> withCombiningHeapLeader(int initialWorkerHeapCapacity, int numberOfThreads,
-                                                       int cntrMin, int cntrMax) {
-        return new Pipq<V>(initialWorkerHeapCapacity, numberOfThreads, cntrMin, cntrMax,
-                new CombiningHeapLeader<V>(numberOfThreads));
-    }
-
     @SuppressWarnings("unchecked")
     public Pipq(int initialWorkerHeapCapacity, int numberOfThreads, int cntrMin, int cntrMax,
                 LeaderLayer<V> leader) {
