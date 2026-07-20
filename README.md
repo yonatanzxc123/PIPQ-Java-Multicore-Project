@@ -45,7 +45,7 @@ pipq.setLogger(new ConcurrentLogger());
 Logger configuration lives in `src/main/resources/log4j2.xml`; trace output is written to `target/pipq-debug.log`.
 
 **This build is local-only.** The course server has no log4j or disruptor jars available, so any upload that both (a) contains `ConcurrentLogger.class` and (b) actually calls `setLogger(new ConcurrentLogger())` will fail on the server with `NoClassDefFoundError`. Before uploading to the server:
-- remove the `pipq.setLogger(new ConcurrentLogger());` line from any code path that runs there, and
+- remove the `pipq.setLogger(new ConcurrentLogger());` line from any code path that runs there (not there by default)
 - exclude `ConcurrentLogger.class` from the uploaded `.class` files (see previous section).
 
 ## Class Map
